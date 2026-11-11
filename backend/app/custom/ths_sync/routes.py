@@ -1,71 +1,133 @@
-"""同花顺同步扩展的 HTTP 接口。
-
-前缀固定在 ``/api/custom/ths-sync``，与核心 API 无交叠。
-"""
-
+# -*- coding: utf-8 -*-
+"""同步接口。挂在 ``/api/custom/ths-sync`` 下。"""
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, ConfigDict, Field
+import logging
 
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, Field
+
+from . import reader
 from . import service
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/custom/ths-sync", tags=["ths-sync"])
 
 
 class ConfigBody(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    """可调项。全部可选，只改传进来的字段。"""
+
     auto: bool | None = None
-    interval: int | None = Field(default=None, ge=service.MIN_INTERVAL, le=3600)
+    interval: int | None = Field(default=None, ge=service.MIN_INTERVAL, le=service.MAX_INTERVAL)
+    sync_ths_to_tsp: bool | None = None
+    sync_tsp_to_ths: bool | None = None
     sync_selfstock: bool | None = None
     sync_positions: bool | None = None
-    ths_user: str | None = Field(default=None, max_length=64)
+    block_name: str | None = None
+    write_ths_selfstock: bool | None = None
+
+    model_config = {"extra": "forbid"}
 
 
 @router.get("/status")
 def get_status() -> dict:
-    """页面唯一数据入口：同步桥状态 + 两池来源 + 上次结果。"""
+    """一站式状态：引擎、配置、同花顺侧、TSP 侧、持仓明细。"""
     return service.build_status()
 
 
 @router.post("/sync")
 def post_sync() -> dict:
-    """立即同步一轮（幂等：只处理差集）。"""
+    """手动触发一次同步。等价于 TSP 界面上的「立即同步」。"""
     try:
         return service.run_once()
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=500, detail=f"同步失败: {exc}") from exc
+    except Exception as exc:
+        logger.exception("手动同步失败")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post("/sync/dry")
+def post_sync_dry() -> dict:
+    """预演：只报告会改什么，不落到任何一端。"""
+    try:
+        return service.run_once(dry=True)
+    except Exception as exc:
+        logger.exception("同步预演失败")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @router.get("/config")
 def get_config() -> dict:
-    return service.get_config()
+    return {"ok": True, "config": service.get_state()}
 
 
 @router.put("/config")
 def put_config(body: ConfigBody) -> dict:
-    return service.set_config(
-        auto=body.auto,
-        interval=body.interval,
-        sync_selfstock=body.sync_selfstock,
-        sync_positions=body.sync_positions,
-        ths_user=body.ths_user,
-    )
+    patch = {k: v for k, v in body.model_dump().items() if v is not None}
+    if "block_name" in patch:
+        name = str(patch["block_name"]).strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="板块名不能为空")
+        patch["block_name"] = name
+    return {"ok": True, "config": service.update_state(patch)}
 
 
 @router.get("/preview")
 def get_preview() -> dict:
-    """只读预览：当前能从同花顺与 v1 各读到什么，不写任何数据。"""
-    selfstock = service.read_selfstock()
-    positions = service.read_positions()
+    """只读预览：两边各读到什么。用于排查「为什么没同步过来」。"""
+    user = reader.find_user()
+    self_codes = reader.read_selfstock(user)
+    positions = reader.read_positions()
+    agent_ok = reader.agent_alive()
+    block_name = str(service.get_state().get("block_name") or service.DEFAULT_BLOCK)
+    block_codes = reader.read_block_codes(block_name, user)
+
     return {
         "ok": True,
-        "selfstock": selfstock if selfstock is not None else [],
-        "selfstock_ok": selfstock is not None,
-        "positions": list((positions or {}).values()),
+        "ths_root": str(reader.ths_root()),
+        "user": user.name if user else "",
+        "user_dir": str(user.user_dir) if user else "",
+        "selfstock_ok": self_codes is not None,
+        "selfstock": self_codes or [],
+        "selfstock_count": len(self_codes or []),
+        "agent_ok": agent_ok,
         "positions_ok": positions is not None,
-        "ths_root": str(service.THS_ROOT),
-        "positions_url": service.V1_POSITIONS_URL,
+        "positions": [p.as_dict() for p in (positions or [])],
+        "positions_count": len(positions or []),
+        "block_name": block_name,
+        "block_ok": block_codes is not None,
+        "block_codes": block_codes or [],
+        "block_count": len(block_codes or []),
+    }
+
+
+@router.get("/blocks")
+def get_blocks() -> dict:
+    """列出同花顺所有板块名与成分数量，便于挑选写入目标。"""
+    blocks = reader.list_blocks()
+    return {
+        "ok": blocks is not None,
+        "blocks": blocks or [],
+        "error": "" if blocks is not None else "读取板块文件失败",
+    }
+
+
+@router.get("/agent")
+def get_agent() -> dict:
+    """同花顺持仓代理的连通性自检。"""
+    alive = reader.agent_alive()
+    version = reader.agent_python_version() if alive else None
+    return {
+        "ok": True,
+        "alive": alive,
+        "port": reader.agent_port(),
+        "python": version,
+        "hint": ""
+        if alive
+        else (
+            "同花顺持仓代理未运行。持仓只能从同花顺进程内读（客户端不落盘），"
+            "请在远航版脚本界面运行一次 backend/app/custom/ths_sync/ths_agent.py"
+        ),
     }
 
 

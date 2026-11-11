@@ -4,18 +4,21 @@
 
 - 上游项目：tick-stock-panel，作者/维护者 shy3130，许可证 MIT。
 - 上游版权声明与许可全文见仓库根目录 `LICENSE`，本分支完整保留，未作修改。
-- 派生版本标记：`v0.3.34-koolook.4`（基于 upstream `v0.3.34`）。
+- 派生版本标记：`v0.3.34-koolook.5`（基于 upstream `v0.3.34`）。
 
-## 本分支新增内容（v0.3.34-koolook.4）
+## 本分支新增内容（v0.3.34-koolook.5）
 
-### 一、源码级后端扩展（进程内）
+### 一、源码级后端扩展（进程内，直连同花顺远航版本机安装）
 
-- `backend/app/custom/ths_sync/__init__.py`
-- `backend/app/custom/ths_sync/service.py`
-- `backend/app/custom/ths_sync/routes.py`
+- `backend/app/custom/ths_sync/__init__.py`：扩展入口，`EXTENSION_ID = "koolook.ths-sync"`
+- `backend/app/custom/ths_sync/reader.py`：定位同花顺用户目录、读自选缓存、读板块成分、经 `127.0.0.1:17660` 读持仓
+- `backend/app/custom/ths_sync/writer.py`：局部替换写板块（保留 `<hevo>` 私有属性）、原子写、写前备份、写后回读校验、写自选缓存、`ths_running()` 客户端运行探测
+- `backend/app/custom/ths_sync/service.py`：双向同步引擎 + 待写入队列 + 后台守护线程
+- `backend/app/custom/ths_sync/routes.py`：`/api/custom/ths-sync` 下的 `status` / `sync` / `sync/dry` / `config` / `preview` / `blocks` / `agent`
+- `backend/app/custom/ths_sync/ths_agent.py`：跑在同花顺内置 Python 3.5 + IronPython 环境里的只读代理（`from ths_api import *` 取 `g_position` / `g_money`）
 
-通过上游既有的后端扩展契约（`EXTENSION_ID` + `setup(registrar)` + `startup(context)`）挂载，
-不改动 `backend/app/main.py` 与任何核心业务模块。对外路由前缀 `/api/custom/ths-sync`。
+通过上游既有的后端扩展契约（`EXTENSION_ID` + `EXTENSION_API_VERSION` + `setup(registrar)` + 可选 `startup(context)`）挂载，
+不改动 `backend/app/main.py`、`backend/app/services/watchlist.py` 或任何核心业务模块。
 
 ### 二、源码级前端扩展
 
@@ -25,34 +28,22 @@
 通过上游既有的前端扩展契约（`import.meta.glob('../custom/*/extension.tsx')`）自动发现，
 不改动核心路由与导航定义。侧栏入口「同花顺同步」，路由 `/ths-sync`。
 
-### 三、外围同步桥（保留，v0.3.34-koolook.3 起提供）
+### 三、外围同步桥（历史版本遗留，保留但已停用）
 
 - `tools/ths_tsp_sync.py`
 - `tools/ths_tsp_sync.json.example`
 - `tools/run_sync_once.bat`
 - `tools/run_sync_loop.bat`
 
-其能力已由上面的一、二两项在进程内实现，桥保留作为无扩展部署环境下的独立方案。
+`.3` 版本的外围方案（独立桥进程 + 运行时页面插件）。`.4` 起能力已由上面的一、二两项在进程内实现，
+`.5` 起不再读取 v1 A 股助手，桥仅作为无扩展部署环境下的参考实现保留。
 
 ### 四、文档与合规
 
 - `RELEASE_NOTES.md`
 - `NOTICE.md`
 
-新增部分随本项目同样以 MIT 许可提供。
+## 本分支不含
 
-## 使用范围声明
-
-本分支仅用于个人本地盯盘：同花顺同步只读取本机同花顺客户端的自选股缓存文件，
-以及本机 v1 服务（`http://127.0.0.1:17651/api/positions`）的持仓数据，写入本机 TSP 自选池。
-
-- 不修改上游服务端业务逻辑，不改动核心 API 契约。
-- 不重新分发上游桌面客户端二进制。
-- 不含任何第三方凭据、账号、token 或运行时用户数据。
-- 不做任何 UI 模拟点击、不抢前台焦点。
-
-## 版本历史说明
-
-- `v0.3.34-koolook.1` / `.2`：产物是未替换的官方 demo 空壳，不含同步功能，已废弃。
-- `v0.3.34-koolook.3`：真实的同步桥 + 运行时页面插件（Page Pack）。
-- `v0.3.34-koolook.4`：升级为源码级前后端扩展，进程内直写，无需独立桥进程。
+账号、密码、Token、Cookie、持仓数据、同花顺用户目录路径的硬编码备份。同花顺安装根目录通过环境变量
+`THS_ROOT` 覆盖，代码内默认值仅为本机常见安装位置。

@@ -1,13 +1,23 @@
-"""源码级后端扩展：同花顺自选股与持仓同步进 TSP 自选池。
+# -*- coding: utf-8 -*-
+"""源码级后端扩展：TSP ↔ 同花顺远航版 双向同步。
 
-用法（随宿主一起启动，无需额外进程）：
-- 后台线程按 config 的 interval（默认 60s）自动同步；
-- 页面或脚本可 POST /api/custom/ths-sync/sync 立即同步一轮；
-- GET /api/custom/ths-sync/status 返回前端页面所需的全部状态。
+架构
+====
+全部逻辑在 TSP 后端进程内，不额外起进程、不开监听端口、不注册 HTTP 回环。
 
-与 ``tools/ths_tsp_sync.py`` 外围桥的区别：本扩展在 TSP 进程内运行，
-直接调用 ``app.services.watchlist`` 写入，不再走 HTTP 回环；两者可同时存在
-（写的是同一份 parquet，幂等差集更新，不会互相破坏）。
+* ``reader``：读同花顺自选（``SelfStockCache.json``）、持仓（进程内代理
+  ``g_position``）、板块（``blockstockV3.xml``）
+* ``writer``：原子写板块，带备份与回读校验
+* ``service``：双向同步引擎 + 后台线程 + 状态汇总
+* ``routes``：``/api/custom/ths-sync/*`` 接口
+* ``ths_agent.py``：跑在同花顺内置 Python 里的只读代理，暴露持仓
+
+自动与手动
+----------
+* 自动：后台 daemon 线程按 ``interval``（默认 60s）跑一轮
+* 手动：TSP 界面「立即同步」按钮 → ``POST /api/custom/ths-sync/sync``
+
+两条都走同一个 ``service.run_once()``，没有第二套逻辑。
 """
 
 from __future__ import annotations
