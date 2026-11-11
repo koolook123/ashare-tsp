@@ -34,6 +34,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -62,6 +63,12 @@ TSP_BATCH = "/api/watchlist/batch"
 TSP_GROUPS = "/api/watchlist/groups"
 # 注意：/api/health 返回前端 HTML（SPA），真正的健康 JSON 在根 /health
 TSP_HEALTH = "/health"
+
+# 桌面端端口是动态的：desktop.py:437 用 _find_free_port(3018)，3018 被占会漂到 3019+。
+# 桥不能写死 3018 —— 启动、每轮同步、状态查询都会重新探测（resolve_tsp_base）。
+TSP_BASE_PORT = 3018
+TSP_PORT_RANGE = 50        # 与 desktop.py:33 _PORT_PROBE_RANGE 对齐
+TSP_PROBE_TIMEOUT = 0.6    # 单端口探测超时；本机拒绝连接是瞬时的，全离线另有 6s 总闸
 
 NOTE = "同花顺同步"           # 标记本桥写入的条目，删除时只删自己写的
 GROUP_SELF = "同花顺自选"     # 盯买点
@@ -219,6 +226,43 @@ def read_positions():
 
 # ---------------- TSP HTTP ----------------
 
+def probe_tsp_health(base: str, token: str = "", timeout: float = TSP_PROBE_TIMEOUT) -> bool:
+    """GET /health 必须真的是 TSP 的 {status:ok,version/mode} JSON，不是 SPA HTML 或别的服务。"""
+    headers = {"Accept": "application/json"}
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    try:
+        req = urllib.request.Request(base + TSP_HEALTH, headers=headers, method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read().decode("utf-8", "replace")
+            d = json.loads(raw) if raw else None
+            return (r.status == 200 and isinstance(d, dict)
+                    and d.get("status") == "ok" and ("version" in d or "mode" in d))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def resolve_tsp_base(configured_base: str, token: str = "") -> str | None:
+    """返回 TSP 当前实际监听的 base：先试配置值，再扫 3018..3067。
+    桌面端重启时端口会从 3018 漂移；写死端口会让整条同步链失联。"""
+    configured_base = (configured_base or f"http://127.0.0.1:{TSP_BASE_PORT}").rstrip("/")
+    if probe_tsp_health(configured_base, token):
+        return configured_base
+    p = urllib.parse.urlsplit(configured_base)
+    scheme, host = p.scheme or "http", p.hostname or "127.0.0.1"
+    deadline = time.monotonic() + 6.0
+    for port in range(TSP_BASE_PORT, TSP_BASE_PORT + TSP_PORT_RANGE):
+        if time.monotonic() > deadline:
+            break
+        cand = f"{scheme}://{host}:{port}"
+        if cand == configured_base:
+            continue
+        if probe_tsp_health(cand, token):
+            log.info("探测到 TSP 漂移端口 %s", cand)
+            return cand
+    return None
+
+
 class TspClient:
     def __init__(self, base: str, token: str = ""):
         self.base = base.rstrip("/")
@@ -253,6 +297,21 @@ class TspClient:
 
     def ok(self, code: int) -> bool:
         return code in (200, 201, 204)
+
+    def refresh_base(self) -> bool:
+        """当前 base 失联时重新探测；成功则原地更新 self.base（所有引用自动生效）。"""
+        found = resolve_tsp_base(self.base, self.token)
+        if found and found != self.base:
+            log.warning("TSP 地址更新 %s → %s", self.base, found)
+            self.base = found
+            return True
+        return bool(found)
+
+    def ensure_online(self) -> bool:
+        """每轮一次快速健康探测；失联才触发端口扫描。"""
+        if probe_tsp_health(self.base, self.token):
+            return True
+        return self.refresh_base()
 
 
 def ensure_group(cli: TspClient, groups: list[dict], name: str, color: str) -> tuple[str, list[dict]]:
@@ -349,6 +408,13 @@ def run_once(cli: TspClient, cfg: dict, dry: bool = False, force: bool = False) 
 
     if not desired:
         result["errors"].append("两端都为空，跳过本轮（防止误清空 TSP）")
+        result["elapsed_ms"] = int((time.time() - t0) * 1000)
+        return result
+
+    # 桌面端重启可能换端口；每轮先确认/重探地址
+    if not cli.ensure_online():
+        result["errors"].append(
+            f"TSP 不在线（已探测 {TSP_BASE_PORT}..{TSP_BASE_PORT + TSP_PORT_RANGE - 1}）")
         result["elapsed_ms"] = int((time.time() - t0) * 1000)
         return result
 
@@ -492,6 +558,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
     def _status(self):
         cli = self.cli
+        cli.ensure_online()   # 端口漂移时自动重探
         c, r = cli.request("GET", TSP_HEALTH, timeout=5)
         tsp_ok = cli.ok(c)
         c2, r2 = cli.request("GET", TSP_WATCHLIST, timeout=5)
@@ -603,14 +670,15 @@ def main() -> int:
     cli = TspClient(cfg["tsp_base"], cfg.get("token") or "")
 
     if args.discover:
+        cli.ensure_online()
         discover(cli)
         return 0
 
-    code, _ = cli.request("GET", TSP_HEALTH, timeout=5)
-    if not cli.ok(code):
-        log.error("连不上 TSP：%s（桌面端/服务起了吗？health=%s）", cfg["tsp_base"], code)
+    if not cli.ensure_online():
+        log.error("连不上 TSP（探测 %d..%d 均失败，桌面端起了吗？）",
+                  TSP_BASE_PORT, TSP_BASE_PORT + TSP_PORT_RANGE - 1)
         return 2
-    log.info("TSP 在线 %s", cfg["tsp_base"])
+    log.info("TSP 在线 %s", cli.base)
 
     if args.loop or args.serve:
         serve_forever(cli, cfg, auto=args.loop)
