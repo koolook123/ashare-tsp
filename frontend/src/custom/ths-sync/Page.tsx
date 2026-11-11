@@ -145,6 +145,17 @@ async function postSync(): Promise<SyncResult> {
   return res.json()
 }
 
+/** 手动一键同步持仓：唯一会连 17660 代理的入口，自动轮询不碰它。 */
+async function postSyncPositions(): Promise<SyncResult> {
+  const res = await fetch(`${API}/sync/positions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: '{}',
+  })
+  if (!res.ok) throw new Error(`持仓同步失败 (${res.status})`)
+  return res.json()
+}
+
 async function putConfig(patch: Record<string, unknown>): Promise<void> {
   const res = await fetch(`${API}/config`, {
     method: 'PUT',
@@ -201,6 +212,9 @@ export function ThsSync() {
       if (res.block) {
         parts.push(`板块 ${res.block.before}→${res.block.after}`)
       }
+      if (res.selfstock_write) {
+        parts.push(`写自选 ${res.selfstock_write.before}→${res.selfstock_write.after}`)
+      }
       setToast(
         res.ok ? `同步完成 · ${parts.join(' / ')}` : `同步有警告 · ${res.errors.join('；')}`,
       )
@@ -211,6 +225,26 @@ export function ThsSync() {
     },
     onError: (err: unknown) => {
       setToast(err instanceof Error ? err.message : '同步失败')
+      window.setTimeout(() => setToast(''), 4000)
+    },
+  })
+
+  const posMutation = useMutation({
+    mutationFn: postSyncPositions,
+    onSuccess: (res) => {
+      const n = res.positions
+      setToast(
+        res.ok
+          ? `持仓同步完成 · ${n} 只 · 新增 ${res.added.length} / 移除 ${res.removed.length}`
+          : `持仓同步有警告 · ${res.errors.join('；')}`,
+      )
+      void qc.invalidateQueries({ queryKey: ['ths-sync-status'] })
+      void qc.invalidateQueries({ queryKey: ['watchlist'] })
+      void qc.invalidateQueries({ queryKey: ['watchlist-groups'] })
+      window.setTimeout(() => setToast(''), 4000)
+    },
+    onError: (err: unknown) => {
+      setToast(err instanceof Error ? err.message : '持仓同步失败')
       window.setTimeout(() => setToast(''), 4000)
     },
   })
@@ -238,7 +272,7 @@ export function ThsSync() {
     <div className="flex h-full min-h-0 flex-col">
       <PageHeader
         title="同花顺同步"
-        subtitle="同花顺自选股与持仓汇入 TSP 自选池 · 进程内直读直写，不模拟界面、不抢焦点"
+        subtitle="同花顺自选自动汇入 TSP；持仓手动一键 · 进程内直读直写，不模拟界面、不抢焦点"
         right={
           <div className="flex items-center gap-2">
             <button
@@ -251,8 +285,26 @@ export function ThsSync() {
             </button>
             <button
               type="button"
+              disabled={posMutation.isPending}
+              onClick={() => posMutation.mutate()}
+              title="读同花顺持仓（g_position）并刷新「同花顺持仓」分组；自动轮询不做这件事"
+              className={cn(
+                'inline-flex items-center gap-1 rounded-btn border border-accent/40 bg-accent/[0.08] px-2.5 py-1.5 text-[11px] font-medium text-accent transition-opacity',
+                posMutation.isPending ? 'opacity-60' : 'hover:opacity-90',
+              )}
+            >
+              {posMutation.isPending ? (
+                <RotateCcw className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <HardDriveDownload className="h-3.5 w-3.5" />
+              )}
+              一键同步持仓
+            </button>
+            <button
+              type="button"
               disabled={syncMutation.isPending}
               onClick={() => syncMutation.mutate()}
+              title="自选双向同步 + 按开关写回同花顺；不含持仓"
               className={cn(
                 'inline-flex items-center gap-1 rounded-btn bg-accent px-2.5 py-1.5 text-[11px] font-medium text-white transition-opacity',
                 syncMutation.isPending ? 'opacity-60' : 'hover:opacity-90',
@@ -263,7 +315,7 @@ export function ThsSync() {
               ) : (
                 <Zap className="h-3.5 w-3.5" />
               )}
-              立即同步
+              立即同步自选
             </button>
           </div>
         }
@@ -374,38 +426,37 @@ export function ThsSync() {
             <div className="flex flex-col gap-2 rounded-card border border-warning/30 bg-warning/[0.05] px-4 py-3">
               <div className="flex items-center gap-1.5 text-[11px] font-medium text-warning">
                 <ShieldAlert className="h-3.5 w-3.5" />
-                三条通道的真实边界（实测结论，不是猜测）
+                四条通道的真实边界（实测结论，不是猜测）
               </div>
               <ul className="flex flex-col gap-1 text-[11px] leading-relaxed text-muted">
                 <li>
                   · <span className="text-secondary">自选股 → TSP</span>：读本地
-                  SelfStockCache.json，稳定可用。
+                  SelfStockCache.json，稳定可用，跟随「自动同步」开关每轮自动跑。
                 </li>
                 <li>
                   · <span className="text-secondary">持仓 → TSP</span>：磁盘上没有任何持仓快照，
-                  只能由同花顺进程内代理（127.0.0.1:17660）提供；代理未运行时本页显示「未运行」，
-                  并沿用上次快照，绝不清空。
+                  只能由同花顺进程内代理（127.0.0.1:17660）提供。
+                  <span className="text-warning">本版已取消自动持仓同步</span>，
+                  改为右上角「一键同步持仓」手动触发；代理未运行时沿用上次快照，绝不清空。
                   {!data.ths.agent_ok && (
                     <span className="text-warning">
-                      {' '}当前未运行——到同花顺「我的策略」里运行 ths_agent.py 即可常驻。
+                      {' '}当前代理未运行——到同花顺「我的策略」里运行 ths_agent.py 即可常驻。
                     </span>
                   )}
                 </li>
                 <li>
-                  · <span className="text-secondary">TSP → 板块 {data.ths.block_name}</span>：
-                  同花顺<span className="text-warning">运行期间写文件会被内存状态覆盖</span>
-                  （实测写入 104 秒后被刷回），所以运行中不写——只把目标内容排队，
-                  等你关闭同花顺后的第一个同步周期自动落盘，
-                  <span className="text-warning">下次启动同花顺才能看到</span>。
-                  该板块是服务端托管块，云端同步仍可能整块覆盖本地内容。
+                  · <span className="text-secondary">TSP → 同花顺自选</span>（主通道）：
+                  写 SelfStockCache.json，运行期<span className="text-accent">不会被覆写</span>，
+                  但要<span className="text-warning">重启同花顺才被读入</span>。
+                  默认开启；为避免清空你手维护的自选，写入集合 = 同花顺自选分组成员 ∪ 你自己挑的。
+                </li>
+                <li>
+                  · <span className="text-secondary">TSP → 板块 {data.ths.block_name}</span>
+                  （默认关闭）：运行期间写文件会被内存状态覆盖（实测 104 秒被刷回），
+                  该板块还是服务端托管块，云端同步可能整块覆盖。既然写不进去，本版不再拿它当主通道。
                   {data.ths.block_volatile_note && (
                     <span className="text-muted"> {data.ths.block_volatile_note}。</span>
                   )}
-                </li>
-                <li>
-                  · <span className="text-secondary">TSP → 同花顺自选</span>：
-                  写 SelfStockCache.json 不会被覆写，但客户端运行中不读它，
-                  <span className="text-warning">需重启同花顺才生效</span>，默认关闭以免覆盖你手维护的自选。
                 </li>
               </ul>
             </div>
@@ -566,17 +617,56 @@ export function ThsSync() {
               </div>
 
               <div className="rounded-card border border-border bg-surface/40 px-4 py-3">
-                <div className="mb-2 text-[11px] font-medium text-secondary">同步开关</div>
+                <div className="mb-2 flex items-center justify-between">
+                  <span className="text-[11px] font-medium text-secondary">同步开关</span>
+                  <span className="text-[10px] text-muted">
+                    {data.config.auto ? `自动运行中 · 每 ${data.config.interval}s` : '自动已关闭'}
+                  </span>
+                </div>
+
+                {/* 主开关：自动同步。BOSS 要的就是这个能随手关掉 */}
+                <label
+                  className={cn(
+                    'mb-2 flex cursor-pointer items-center justify-between gap-3 rounded-btn border px-3 py-2 transition-colors',
+                    data.config.auto
+                      ? 'border-accent/40 bg-accent/[0.06]'
+                      : 'border-border bg-surface/60',
+                  )}
+                >
+                  <span className="min-w-0">
+                    <span
+                      className={cn(
+                        'text-[12px] font-medium',
+                        data.config.auto ? 'text-accent' : 'text-secondary',
+                      )}
+                    >
+                      自动同步
+                    </span>
+                    <span className="ml-2 text-[10px] text-muted">
+                      关掉后只在点按钮时同步
+                    </span>
+                  </span>
+                  <input
+                    type="checkbox"
+                    checked={data.config.auto}
+                    disabled={cfgMutation.isPending}
+                    onChange={e => cfgMutation.mutate({ auto: e.target.checked })}
+                    className="h-4 w-4 shrink-0 accent-[var(--accent)]"
+                  />
+                </label>
+
                 <div className="flex flex-col gap-2">
                   {[
-                    { key: 'auto', label: '自动同步', hint: `每 ${data.config.interval}s 一轮` },
-                    { key: 'sync_selfstock', label: '同花顺自选 → TSP', hint: '读本地缓存' },
-                    { key: 'sync_positions', label: '同花顺持仓 → TSP', hint: '需持仓代理' },
-                    { key: 'sync_tsp_to_ths', label: 'TSP → 同花顺板块', hint: '运行中排队，关闭后落盘' },
+                    { key: 'sync_selfstock', label: '同花顺自选 → TSP', hint: '读本地缓存 · 自动' },
                     {
                       key: 'write_ths_selfstock',
                       label: 'TSP → 同花顺自选',
-                      hint: '需重启同花顺生效',
+                      hint: '主通道 · 需重启同花顺生效',
+                    },
+                    {
+                      key: 'sync_tsp_to_ths',
+                      label: 'TSP → 同花顺板块',
+                      hint: '写不进去，默认关闭',
                     },
                   ].map(item => {
                     const on = Boolean(
@@ -601,16 +691,35 @@ export function ThsSync() {
                       </label>
                     )
                   })}
+
+                  {/* 持仓不是开关，是手动按钮 */}
+                  <div className="flex items-center justify-between gap-2 border-t border-border/60 pt-2">
+                    <span className="min-w-0">
+                      <span className="text-[11px] text-secondary">同花顺持仓 → TSP</span>
+                      <span className="ml-2 text-[10px] text-muted">
+                        手动一键 · 自动已取消
+                      </span>
+                    </span>
+                    <button
+                      type="button"
+                      disabled={posMutation.isPending}
+                      onClick={() => posMutation.mutate()}
+                      className="shrink-0 rounded-btn border border-accent/40 px-2 py-0.5 text-[10px] text-accent transition-opacity hover:opacity-80 disabled:opacity-50"
+                    >
+                      {posMutation.isPending ? '同步中…' : '立即同步持仓'}
+                    </button>
+                  </div>
                 </div>
                 <div className="mt-2 border-t border-border/60 pt-2 text-[10px] text-muted">
-                  「TSP → 同花顺自选」默认关闭：SelfStockCache.json 同时是本同步的入向数据源，
-                  写回会形成回环并覆盖你手工维护的同花顺自选。开启后写入集合 =
-                  自选池里你自己挑的标的（不含同花顺同步来的）。
+                  「自动同步」只跑自选（纯读本地文件，几十毫秒）；持仓要连本机
+                  17660 代理，代理没起时会走满超时，所以本版改成手动一键，自动轮询不再碰它。
                   <br />
-                  写回同花顺的两路（板块与自选）都只在
-                  <span className="text-secondary">同花顺关闭期间</span>
-                  才会真正落盘，并在下次启动同花顺时被读入——这是实测出来的唯一可用通道：
-                  运行期间写入会被客户端内存态覆盖。
+                  「TSP → 同花顺自选」是写回主通道：SelfStockCache.json 运行期不被覆写，
+                  写入集合 = 同花顺自选分组成员 ∪ 你自己挑的标的，两条硬保护（入向关闭时跳过、
+                  目标集为空时跳过）避免把你在同花顺里的自选整份抹掉。
+                  <br />
+                  「TSP → 同花顺板块」默认关闭：实测运行期写入 104 秒后被客户端内存态刷回，
+                  且 ai选股 是服务端托管块，写它没有可用窗口。
                 </div>
               </div>
             </div>

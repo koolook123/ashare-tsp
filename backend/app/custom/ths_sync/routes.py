@@ -38,11 +38,29 @@ def get_status() -> dict:
 
 @router.post("/sync")
 def post_sync() -> dict:
-    """手动触发一次同步。等价于 TSP 界面上的「立即同步」。"""
+    """手动触发一次同步。等价于 TSP 界面上的「立即同步」。
+
+    这一轮只跑自选：持仓是独立的手动一键通道（``POST /sync/positions``），
+    因为读持仓要连本机 17660 代理，代理没起时会走满 socket 超时。
+    """
     try:
-        return service.run_once()
+        return service.run_once(with_positions=False)
     except Exception as exc:
         logger.exception("手动同步失败")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post("/sync/positions")
+def post_sync_positions() -> dict:
+    """手动一键同步持仓：读同花顺 ``g_position`` 并刷新「同花顺持仓」分组。
+
+    这是持仓唯一的同步入口——自动线程不碰持仓。返回体与 ``POST /sync`` 同构，
+    但 ``positions`` / ``position_pnl_total`` 一定有值（除非代理未启动）。
+    """
+    try:
+        return service.run_once(with_positions=True)
+    except Exception as exc:
+        logger.exception("手动同步持仓失败")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 

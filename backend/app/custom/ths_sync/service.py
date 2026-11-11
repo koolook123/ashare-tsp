@@ -14,37 +14,51 @@
 
 两个方向
 ========
-* ``同花顺 → TSP``：自选股 ``SelfStockCache.json`` + 持仓 ``g_position``
-  分别汇入 TSP 自选池的两个分组（``同花顺自选`` / ``同花顺持仓``）。
-* ``TSP → 同花顺``：TSP 自选池里**用户自己挑的**标的分两路写回同花顺：
-  ``ai选股`` 板块（写 ``blockstockV3.xml``）与 ``SelfStockCache.json`` 自选缓存。
+* ``同花顺 → TSP``：自选股 ``SelfStockCache.json`` 自动汇入「同花顺自选」分组；
+  持仓 ``g_position`` **只在手动一键同步时**汇入「同花顺持仓」分组。
+* ``TSP → 同花顺``：写 ``SelfStockCache.json`` 自选缓存（TSP → 同花顺 的主通道）。
+  写板块 ``ai选股`` 默认关闭，理由见下。
 
-写同花顺为什么必须「等客户端退出」
+为什么「自动只跑自选、持仓走手动」
 ----------------------------------
+持仓必须连同花顺进程内代理（``127.0.0.1:17660``）才能读。代理没起时每次读都要走满
+socket 超时；自动线程每 60 秒一轮，会被它拖慢，而且用户没有「实时看持仓」的需求。
+所以自动轮询只跑自选（纯读文件，几十毫秒），持仓由页面上的「一键同步」手动触发。
+
+为什么 TSP → 同花顺 写自选而不是写板块
+--------------------------------------
 实测四组实验的结论（2026-11-11，见 ``writer.py`` 模块文档）：
 
 * 同花顺**启动时**读入 ``blockstockV3.xml`` 与 ``SelfStockCache.json`` 作为内存初值。
-* 同花顺**运行期间**用内存态周期/事件驱动整份覆写这两个文件，从不读回。
+* 同花顺**运行期间**用内存态周期/事件驱动整份覆写 ``blockstockV3.xml``，从不读回。
   实测写进 ``ai选股`` 的 3 只标的 104 秒后被刷回。
+* ``SelfStockCache.json`` 运行期**不被覆写**：写进去就一直留着，只是要重启客户端才被读入。
 * 新增一个客户端内存里没有的块，启动时会被直接丢弃（带 ``IsRemove`` 删除标记）。
 * ``ai选股`` 是服务端托管块，云端同步随时可能整块覆盖本地镜像。
 
-因此本模块对「TSP → 同花顺」的处理是：
+结论：写板块没有可用窗口（要么 2 分钟内被抹，要么被云端覆盖），写自选才是能真正
+落地并长期存活的通道。因此 ``write_ths_selfstock`` 默认**开启**并作为主通道，
+``sync_tsp_to_ths``（写板块）默认**关闭**，仅作为可选实验开关保留。
 
-1. 客户端**正在运行** → 不写文件，把待写内容存进 ``pending_block`` 队列，
-   本轮 skipped 里说明「已排队，等同花顺关闭后落盘」。
-2. 客户端**已关闭** → 立即落盘（此时写入会被下次启动读入，真正生效）。
-3. 每轮 ``run_once`` 开头先检查队列：若客户端已关闭且队列非空，先把它刷出去。
+写自选的集合与保护
+------------------
+目标集合 = 本轮从同花顺读到的自选 ∪ TSP 里用户自己挑的标的。**只做加法，从不删除**。
 
-这样既不会写进一个「马上被抹掉」的状态骗用户，也不需要用户手动卡时机。
+这里踩过一次很重的坑，必须写下来：早前用「TSP 自选池里的「同花顺自选」分组成员」当基准，
+并且把「我们写进同花顺的代码」从入向来源里剔除来切断回环。结果写自选时把整个目标集
+记成「我写的」，下一轮它被整体排除，``desired_self`` 变成空集，
+``owned - 空集`` 就把 TSP 里 40 只同步标的全部删光，写回又把同花顺自选截成 5 只——
+一次同步把两边的数据都吃掉了一大半。
 
-为什么 TSP→同花顺 只写「用户自己挑的」
---------------------------------------
-自选池里有两个分组是同步进来的（同花顺自选、同花顺持仓）。如果把它们也算进
-「TSP 的股票」，写回 ai选股 就等于把同花顺自己的数据又推回同花顺，形成回路，
-而且会把同花顺原生 ai选股 的内容整份覆盖掉。
-所以写入集合 = 自选池全部标的 − 同花顺同步进来的标的。
-该集合为空时**跳过写入**，原样保留 ai选股 现有成分——宁可不动，不猜。
+现在改成：基准取来源本身（``self_codes``），不取下游分组；不再维护「我写的」排除集。
+写回就永远是「同花顺原有的 + 你新加的」，不可能把同花顺自选写少。
+代价：在 TSP 里删一只不会让同花顺少一只，删除请直接在同花顺里删——比误删安全得多。
+
+三条硬保护，宁可不动也不能清空用户自选：
+
+1. 入向同步（``sync_ths_to_tsp``）关闭时直接跳过——此时没有可信来源。
+2. 本轮没读到同花顺自选（``self_codes is None``）时跳过——来源不可信，算出来必然偏小。
+3. 目标集合为空时跳过——空集写入等于清空。
 """
 from __future__ import annotations
 
@@ -85,6 +99,12 @@ DEFAULT_BLOCK = "ai选股"
 #: 状态文件（落在 TSP 的 data_dir）。
 STATE_FILENAME = "ths_sync_state.json"
 
+#: 状态文件结构版本。老版本文件里的开关默认值需要迁移，否则升级后仍然是旧行为。
+#: v1：sync_positions=True（自动读持仓）、sync_tsp_to_ths=True（写板块）、
+#:     write_ths_selfstock=False（写自选默认关）
+#: v2：持仓改手动、板块写入关闭、写自选打开（自选成为 TSP → 同花顺 的主通道）
+STATE_VERSION = 2
+
 _RUNTIME: dict[str, Any] = {
     "started_at": "",
     "sync_count": 0,
@@ -95,17 +115,22 @@ _RUNTIME: dict[str, Any] = {
 }
 
 _STATE: dict[str, Any] = {
+    "state_version": STATE_VERSION,
     "auto": True,
     "interval": DEFAULT_INTERVAL,
     "sync_ths_to_tsp": True,
-    "sync_tsp_to_ths": True,
+    # TSP → 同花顺板块（blockstockV3.xml 的 ai选股）。
+    # 默认关闭：实测客户端每 2 分钟内用内存态整份覆写该文件，本地写入存活极短，
+    # 且 ai选股 是服务端托管块，云端同步随时覆盖。写它没有实际收益。
+    "sync_tsp_to_ths": False,
     "block_name": DEFAULT_BLOCK,
     "sync_selfstock": True,
-    "sync_positions": True,
-    # TSP → 同花顺自选缓存（持久，需重启客户端读入）。
-    # 默认关闭：自选缓存同时是本同步的**入向数据源**，写回会造成回环，
-    # 而且会把用户自己维护的同花顺自选整份替换掉。需要时手动开。
-    "write_ths_selfstock": False,
+    # 持仓同步默认关闭：BOSS 要求改成手动一键，自动轮询不再读持仓。
+    # 自动线程只跑「自选」；持仓由 POST /sync/positions 手动触发。
+    "sync_positions": False,
+    # TSP → 同花顺自选缓存。这是 TSP → 同花顺 的**主通道**：
+    # 该文件运行期不被覆写，写入可持久存活，只需重启客户端读入。
+    "write_ths_selfstock": True,
     # 我们写进同花顺自选缓存的代码，用于「只删自己加过的」与切断入向回环。
     "ths_written_selfstock": [],
     # 待写入同花顺的板块内容。同花顺运行期间写文件会被内存态覆盖，
@@ -144,9 +169,26 @@ def load_state(data_dir: Path) -> None:
             return
         if not isinstance(payload, dict):
             return
+        old_version = 0
+        try:
+            old_version = int(payload.get("state_version") or 0)
+        except (TypeError, ValueError):
+            old_version = 0
         for key, value in payload.items():
             if key in _STATE:
                 _STATE[key] = value
+        # v1 → v2 迁移：v1 的开关组合是「自动读持仓 + 写板块 + 不写自选」，
+        # 与现在的产品口径正好相反。老文件必须显式改写成新口径，
+        # 只迁移一次（迁完写回 state_version=2，用户之后的手动改动不再被覆盖）。
+        if old_version < STATE_VERSION:
+            _STATE["sync_positions"] = False
+            _STATE["sync_tsp_to_ths"] = False
+            _STATE["write_ths_selfstock"] = True
+            _STATE["pending_block"] = []
+            _STATE["pending_block_name"] = ""
+            _STATE["pending_block_ts"] = ""
+            logger.info("ths_sync_state.json 从 v%d 迁移到 v%d", old_version, STATE_VERSION)
+        _STATE["state_version"] = STATE_VERSION
         # 修正越界值
         try:
             interval = int(_STATE.get("interval") or DEFAULT_INTERVAL)
@@ -252,8 +294,19 @@ def _sync_group_members(
 # ---------------------------------------------------------------- 主流程
 
 
-def run_once(*, dry: bool = False) -> dict[str, Any]:
-    """执行一次双向同步。异常不外抛，全部收进 ``errors``。"""
+def run_once(
+    *, dry: bool = False, with_positions: bool | None = None
+) -> dict[str, Any]:
+    """执行一次同步。异常不外抛，全部收进 ``errors``。
+
+    ``with_positions``：本轮是否读同花顺持仓。
+    * ``None``（默认）→ 按 ``state["sync_positions"]``；
+    * ``False`` → 强制不读，自动线程走这条（持仓只能手动一键同步）；
+    * ``True``  → 强制读，``POST /sync/positions`` 走这条。
+
+    读持仓要连 127.0.0.1:17660 代理，代理未起时会走满 socket 超时；
+    自动线程每 60 秒跑一次，不该被它拖慢，因此自动轮询不碰持仓。
+    """
     started = time.time()
     result: dict[str, Any] = {
         "ok": False,
@@ -275,6 +328,10 @@ def run_once(*, dry: bool = False) -> dict[str, Any]:
     with _LOCK:
         state = dict(_STATE)
 
+    want_positions = (
+        bool(state.get("sync_positions", False)) if with_positions is None else bool(with_positions)
+    )
+
     user = reader.find_user()
     if user is None:
         result["errors"].append("找不到同花顺用户目录（%s/bin/users/）" % reader.ths_root())
@@ -290,18 +347,18 @@ def run_once(*, dry: bool = False) -> dict[str, Any]:
     else:
         result["skipped"].append("已关闭「同花顺自选 → TSP」")
 
-    # ---- 读同花顺持仓
+    # ---- 读同花顺持仓（只在手动一键同步时读）
     positions: list[reader.Position] | None = None
-    if state.get("sync_positions", True):
+    if want_positions:
         positions = reader.read_positions()
         if positions is None:
             result["skipped"].append(
-                "持仓通道不可用（同花顺未运行或代理脚本未启动），本轮保留 TSP 现有内容"
+                "持仓读取失败（同花顺未运行或持仓代理未启动），本轮保留 TSP 现有持仓条目"
             )
         else:
             result["positions"] = len(positions)
     else:
-        result["skipped"].append("已关闭「同花顺持仓 → TSP」")
+        result["skipped"].append("持仓同步为手动一键模式，本轮未读取持仓")
 
     # ---- TSP 现状
     try:
@@ -321,13 +378,14 @@ def run_once(*, dry: bool = False) -> dict[str, Any]:
     }
 
     # ---- 计算目标集合
+    #
+    # 不要在这里把「我们自己写进同花顺自选的代码」从入向来源里剔除。
+    # 曾经那样做过，结果是灾难性的自我吞噬：写自选时把整个目标集记成「我写的」，
+    # 下一轮它被整体从来源里排除，desired_self 变成空集，
+    # 于是 owned - 空集 把所有同步来的标的从 TSP 删光，写回时又把同花顺自选清成几剩只。
+    # 只增不减才是安全的：入向就是同花顺有什么就同步什么。
     want_apply = state.get("sync_ths_to_tsp", True)
-    # 我们自己写进同花顺自选的代码不算「同花顺原生自选」，
-    # 否则它们会被当成同步来源再导回 TSP，分组归属来回抖。
-    written_th = {str(c) for c in (state.get("ths_written_selfstock") or [])}
-    self_codes_native = (
-        [c for c in self_codes if c not in written_th] if self_codes is not None else None
-    )
+    self_codes_native = self_codes
     desired_self: set[str] = set(self_codes_native or []) if want_apply else set()
     desired_pos: set[str] = {p.code for p in (positions or [])} if want_apply else set()
     desired_all = desired_self | desired_pos
@@ -514,52 +572,92 @@ def run_once(*, dry: bool = False) -> dict[str, Any]:
 
     result["block"] = block_info
 
-    # ---- 写同花顺自选缓存：持久通道（需重启客户端读入）
+    # ---- 写同花顺自选缓存：TSP → 同花顺 的主通道（需重启客户端读入）
+    #
+    # 为什么改走自选而不是板块：实测 blockstockV3.xml 每 2 分钟内被客户端内存态
+    # 整份覆写，本地写入存活极短，且 ai选股 是服务端托管块。而 SelfStockCache.json
+    # 运行期不被覆写，写进去就一直在，只是要重启客户端才被读入——这才是能用的通道。
+    #
+    # 目标集合 = TSP 自选池里「同花顺自选」分组的成员 ∪ 你自己挑的标的。
+    # 前者已经把同花顺原生自选全部包含进来（入向同步保证），所以这是**真双向**：
+    # 你在 TSP 里删掉一只，下次写回同花顺也会少一只；同理你新加一只，同花顺会多一只。
+    #
+    # 两条硬保护，宁可不动也不能清空用户自选：
+    # 1. 入向同步关闭时直接跳过——此时 TSP 里没有同花顺原生自选，算出来的目标集
+    #    只是你自己挑的几只，整份替换会把同花顺原有的自选全部抹掉。
+    # 2. 目标集合为空时跳过——同理，空集写入等于清空。
     selfstock_write: dict[str, Any] | None = None
     if state.get("write_ths_selfstock") and user is not None:
-        try:
-            rows_now = watchlist.list_symbols()
-            native_codes = [
-                str(r.get("symbol") or "")
-                for r in rows_now
-                if NOTE not in str(r.get("note") or "")
-            ]
-            native_codes = [c for c in native_codes if reader.is_a_stock(c)]
-            seen2: set[str] = set()
-            native_codes = [c for c in native_codes if not (c in seen2 or seen2.add(c))]
-        except Exception as exc:
-            native_codes = []
-            result["errors"].append("计算待写自选缓存清单失败：%s" % exc)
-
-        if dry:
-            before_codes = reader.read_selfstock(user) or []
-            selfstock_write = {
-                "dry": True,
-                "before": len(before_codes),
-                "after": len(native_codes),
-                "changed": sorted(before_codes) != sorted(native_codes),
-                "need_restart": True,
-            }
+        if not state.get("sync_ths_to_tsp", True):
+            result["skipped"].append(
+                "「同花顺自选 → TSP」已关闭，为避免整份覆盖清空同花顺自选，本轮不写自选缓存"
+            )
+        elif self_codes is None:
+            # 本轮没读到同花顺自选，说明来源不可信；此时算出的目标集可能远小于真实值，
+            # 写下去就是整份截断。宁可不写。
+            result["skipped"].append(
+                "本轮没读到同花顺自选，来源不可信，跳过写自选缓存（避免截断）"
+            )
         else:
-            wr = writer.write_selfstock(user.self_cache, native_codes)
-            selfstock_write = {
-                "ok": bool(wr.get("ok")),
-                "changed": bool(wr.get("changed")),
-                "before": len(wr.get("before") or []),
-                "after": len(wr.get("after") or []),
-                "need_restart": bool(wr.get("need_restart")),
-                "error": wr.get("error") or "",
-            }
-            if not wr.get("ok"):
-                result["errors"].append(
-                    "写入同花顺自选缓存失败：%s" % (wr.get("error") or "未知原因")
+            try:
+                rows_now = watchlist.list_symbols()
+                native_codes = [
+                    str(r.get("symbol") or "")
+                    for r in rows_now
+                    if NOTE not in str(r.get("note") or "")
+                ]
+                native_codes = [c for c in native_codes if reader.is_a_stock(c)]
+            except Exception as exc:
+                native_codes = []
+                result["errors"].append("计算待写自选缓存清单失败：%s" % exc)
+
+            # 目标集合 = 同花顺现有自选 ∪ TSP 里你自己挑的（只做加法）。
+            #
+            # 用 self_codes（本轮从同花顺读来的）而不是 TSP 分组反查，是关键：
+            # 分组是下游状态，一旦上游算错它也跟着错；用来源本身做基准，
+            # 写回就永远是「同花顺原有的 + 你新加的」，不可能把同花顺自选写少。
+            # 代价是「在 TSP 删一只」不会让同花顺少一只——删除请直接在同花顺里删，
+            # 这比误删用户数据安全得多。
+            target_codes = sorted(
+                {c for c in (self_codes or []) if reader.is_a_stock(c)}
+                | {c for c in native_codes if c}
+            )
+
+            if not target_codes:
+                result["skipped"].append(
+                    "目标自选集合为空（TSP 侧没有可写回的标的），本轮保留同花顺自选原样"
                 )
-            elif wr.get("changed"):
-                # 记下我们写进去的代码，供下一轮排除回环 + 精确回滚
-                with _LOCK:
-                    _STATE["ths_written_selfstock"] = list(native_codes)
-                save_state()
-                selfstock_write["written"] = len(native_codes)
+            elif dry:
+                before_codes = reader.read_selfstock(user) or []
+                selfstock_write = {
+                    "dry": True,
+                    "before": len(before_codes),
+                    "after": len(target_codes),
+                    "changed": sorted(before_codes) != target_codes,
+                    "need_restart": True,
+                }
+            else:
+                wr = writer.write_selfstock(user.self_cache, target_codes)
+                selfstock_write = {
+                    "ok": bool(wr.get("ok")),
+                    "changed": bool(wr.get("changed")),
+                    "before": len(wr.get("before") or []),
+                    "after": len(wr.get("after") or []),
+                    "need_restart": bool(wr.get("need_restart")),
+                    "error": wr.get("error") or "",
+                }
+                if not wr.get("ok"):
+                    result["errors"].append(
+                        "写入同花顺自选缓存失败：%s" % (wr.get("error") or "未知原因")
+                    )
+                elif wr.get("changed"):
+                    # 只作信息展示（「上次写了几只」），不再用于排除入向来源。
+                    # 曾用它做回环切断，结果下一轮把整份同花顺自选当成「自己写的」
+                    # 全部排除，desired_self 变空，级联清空两边。见目标集合那段注释。
+                    with _LOCK:
+                        _STATE["ths_written_selfstock"] = list(target_codes)
+                    save_state()
+                    selfstock_write["written"] = len(target_codes)
     elif user is None:
         pass
     elif not state.get("write_ths_selfstock"):
@@ -661,9 +759,9 @@ def build_status() -> dict[str, Any]:
             "block_ok": block_codes is not None,
             "block_volatile": writer.ths_running(),
             "block_volatile_note": (
-                "同花顺正在运行：板块写入会排队，关闭同花顺后自动落盘，下次启动可见"
+                "同花顺正在运行：写板块会被内存态覆盖，本版已默认关闭板块写入"
                 if writer.ths_running()
-                else "同花顺已关闭：板块写入立即落盘，下次启动同花顺时被读入"
+                else "同花顺已关闭：此时写板块才会被下次启动读入"
             ),
             "selfstock_writable": bool(user is not None),
             "ths_written_count": len(state.get("ths_written_selfstock") or []),
@@ -694,7 +792,9 @@ def _loop() -> None:
             _STOP.wait(min(interval, 30))
             continue
         try:
-            run_once()
+            # 自动轮询只跑自选，不碰持仓：持仓是手动一键通道，
+            # 且代理未起时会走满 socket 超时，不能拖慢 60 秒的自动节奏。
+            run_once(with_positions=False)
         except Exception:
             logger.exception("ths-sync 自动同步异常")
         _STOP.wait(interval)
