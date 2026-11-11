@@ -1,0 +1,7 @@
+﻿{
+  "tsp_base": "http://127.0.0.1:3018",
+  "token": "",
+  "interval": 60,
+  "sync_selfstock": true,
+  "sync_positions": true
+}
