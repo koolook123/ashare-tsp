@@ -1,26 +1,27 @@
 # -*- coding: utf-8 -*-
-"""同花顺远航版 → TSP 同步桥。
+"""同花顺远航版 → TSP 同步桥 (v2 · 实测可跑版)
 
 设计原则（BOSS 硬约束）：
-  1 绝不抢焦点、绝不做 UI 模拟点击 —— 只读文件 + 调 HTTP，同花顺该干嘛干嘛。
-  2 自选股：读本地缓存文件（SelfStockCache.json + selfstock_*.json 取并集）。
-  3 持仓：读 v1 老服务 /api/positions（v1 的 OCR 已把成本含费算好，直接复用，
-    不重跑 OCR、不碰 xiadan.exe）。
-  4 推送：走 TSP 开放接口（Token 六档权限）。
-  5 两种模式：--once 一键同步 / --loop 自动轮询（默认 60 秒，只推变化）。
+  1 绝不抢焦点、绝不做 UI 模拟点击 —— 只读本地缓存文件 + 调 HTTP。
+  2 自选股：读 SelfStockCache.json + xiadan-plus/selfstock_*.json 取并集。
+  3 持仓：读 v1 老服务 /api/positions（v1 的 OCR 已把成本含费算好，直接复用）。
+  4 推送：直写 TSP 现有 POST /api/watchlist/batch，并用两个自选分组区分两池
+     （「同花顺自选」盯买点 / 「同花顺持仓」盯卖点，对齐 v1 铁律）。
+  5 自动同步 --loop（默认 60 秒，纯后台线程）；一键按钮走 127.0.0.1:17652
+     的 GET /api/status、POST /api/sync；--once 供 .bat 双击调用。
 
-为什么不用 UI 模拟：
-  v1 的 ths_ui.py 是为「写板块让手机可见」造的，必须抢前台。而本任务只是把
-  数据「读出来」给 TSP，读文件是零打扰路径，不存在焦点竞争。
+为什么不用 /api/openapi.json?tier=a 动态找端点：
+  实测桌面端 v0.3.34 该接口返回空 paths；扩展表写入端点需 admin 且要建表。
+  而 POST /api/watchlist/batch 已实测可用且无需 token（auth configured=false），
+  因此这里全部硬编码为已验证契约，不再猜端点。
 
 用法：
-  python tools/ths_tsp_sync.py --discover          # 第一步：打印 TSP 全部端点
-  python tools/ths_tsp_sync.py --dry-run --once    # 第二步：只看读到了什么，不推送
-  python tools/ths_tsp_sync.py --once              # 一键同步
-  python tools/ths_tsp_sync.py --loop              # 后台自动（60 秒一轮）
-
-配置文件：tools/ths_tsp_sync.json（首次运行自动生成模板）
-  {"tsp_base": "http://127.0.0.1:3018", "token": "tsp_xxx", "interval": 60}
+  python ths_tsp_sync.py --once                 # 跑一轮就退出（.bat 一键同步）
+  python ths_tsp_sync.py --loop                # 自动轮询 + 本地按钮服务（推荐）
+  python ths_tsp_sync.py --serve               # 只起按钮服务，不自动轮询
+  python ths_tsp_sync.py --dry-run             # 只读不写，打印将同步什么
+  python ths_tsp_sync.py --install             # 写入 Windows 启动项（pythonw 隐藏运行）
+  python ths_tsp_sync.py --discover            # 打印 TSP 自选/分组现状
 """
 from __future__ import annotations
 
@@ -30,10 +31,12 @@ import logging
 import os
 import re
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 # ---------------- 路径与常量 ----------------
@@ -53,58 +56,76 @@ THS_XIADAN_DIR = THS_ROOT / "transaction" / "xiadan-plus"
 # v1 老服务（只读，绝不改它）
 V1_POSITIONS_URL = "http://127.0.0.1:17651/api/positions"
 
+# TSP 已验证端点
+TSP_WATCHLIST = "/api/watchlist"
+TSP_BATCH = "/api/watchlist/batch"
+TSP_GROUPS = "/api/watchlist/groups"
+# 注意：/api/health 返回前端 HTML（SPA），真正的健康 JSON 在根 /health
+TSP_HEALTH = "/health"
+
+NOTE = "同花顺同步"           # 标记本桥写入的条目，删除时只删自己写的
+GROUP_SELF = "同花顺自选"     # 盯买点
+GROUP_POS = "同花顺持仓"      # 盯卖点
+COLOR_SELF = "sky"
+COLOR_POS = "rose"
+
 DEFAULT_CONFIG = {
     "tsp_base": "http://127.0.0.1:3018",
-    "token": "",
+    "token": "",              # 桌面端无鉴权，留空即可；Docker 版可填 Bearer
     "interval": 60,
+    "bridge_host": "127.0.0.1",
+    "bridge_port": 17652,
     "sync_selfstock": True,
     "sync_positions": True,
 }
 
-# A 股白名单：6 位数字，首位 0/3/6/8/4，排除占位码
 _A_STOCK_RE = re.compile(r"^[03684]\d{5}$")
-_PLACEHOLDER = {"000000", "999999", "888888"}
-
-
-def is_a_stock(code: str) -> bool:
-    c = (code or "").strip()
-    return bool(_A_STOCK_RE.match(c)) and c not in _PLACEHOLDER
-
-
-# ---------------- 日志 ----------------
-
 log = logging.getLogger("ths_tsp_sync")
+
+# 全局运行态（供 HTTP 状态接口读）
+_RUNTIME = {
+    "started_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    "auto": False,
+    "interval": 60,
+    "last_sync": "",
+    "last_result": None,
+    "sync_count": 0,
+    "lock": threading.Lock(),
+}
+
+
+def is_a_stock(c: str) -> bool:
+    return bool(_A_STOCK_RE.match(c))
 
 
 def setup_log(verbose: bool = False) -> None:
     log.setLevel(logging.DEBUG if verbose else logging.INFO)
-    fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%Y-%m-%d %H:%M:%S")
+    log.handlers.clear()
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%H:%M:%S")
     sh = logging.StreamHandler(sys.stdout)
     sh.setFormatter(fmt)
     log.addHandler(sh)
     try:
         fh = logging.FileHandler(LOG_PATH, encoding="utf-8")
-        fh.setFormatter(fmt)
+        fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
         log.addHandler(fh)
-    except Exception:
-        pass
+    except Exception as e:  # noqa: BLE001
+        log.debug("日志文件不可用: %s", e)
 
-
-# ---------------- 配置 ----------------
 
 def load_config() -> dict:
     cfg = dict(DEFAULT_CONFIG)
     if CONFIG_PATH.exists():
         try:
             cfg.update(json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig")))
-        except Exception as e:
-            log.warning("配置解析失败，用默认值: %s", e)
+        except Exception as e:  # noqa: BLE001
+            log.warning("配置文件读取失败，用默认值: %s", e)
     else:
         CONFIG_PATH.write_text(
             json.dumps(DEFAULT_CONFIG, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
-        log.info("已生成配置模板: %s（填 token 后重跑）", CONFIG_PATH)
+        log.info("已生成配置: %s", CONFIG_PATH)
     return cfg
 
 
@@ -112,9 +133,9 @@ def load_state() -> dict:
     if STATE_PATH.exists():
         try:
             return json.loads(STATE_PATH.read_text(encoding="utf-8-sig"))
-        except Exception:
+        except Exception:  # noqa: BLE001
             pass
-    return {"selfstock": [], "positions": {}, "ts": ""}
+    return {}
 
 
 def save_state(st: dict) -> None:
@@ -122,67 +143,62 @@ def save_state(st: dict) -> None:
         STATE_PATH.write_text(
             json.dumps(st, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
         )
-    except Exception as e:
-        log.warning("状态落盘失败: %s", e)
+    except Exception as e:  # noqa: BLE001
+        log.warning("状态写入失败: %s", e)
 
 
-# ---------------- 同花顺侧：只读 ----------------
+# ---------------- 读取同花顺 / v1 ----------------
 
-def read_selfstock() -> list[str]:
-    """自选股代码列表。
-
-    SelfStockCache.json 结构：
-      {"Data": {"Selfstock": "002029|601566|...,33|17|...", "Count": 50, ...}}
-    逗号前是代码（| 分隔），逗号后是市场号，两段长度一一对应。
-    另外 xiadan-plus/selfstock_*.json 是同花顺下单端的自选缓存，取并集更稳。
-    """
+def read_selfstock():
+    """返回代码 list；缓存文件缺失/损坏返回 None（表示「沿用上次」，不误清空）。"""
     out: list[str] = []
     seen: set[str] = set()
+    ok = False
 
     def _eat(path: Path) -> None:
+        nonlocal ok
         try:
             j = json.loads(path.read_text(encoding="utf-8-sig"))
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             log.debug("读 %s 失败: %s", path.name, e)
             return
         d = j.get("Data") or j.get("data") or {}
         raw = d.get("Selfstock") or d.get("selfstock") or ""
-        head = raw.split(",")[0]
+        head = str(raw).split(",")[0]
         for c in head.split("|"):
             c = c.strip()
             if is_a_stock(c) and c not in seen:
                 seen.add(c)
                 out.append(c)
+        ok = True
 
     if THS_SELFSTOCK.exists():
         _eat(THS_SELFSTOCK)
     else:
-        log.warning("自选股缓存不存在（同花顺没开过？）: %s", THS_SELFSTOCK)
+        log.warning("自选股缓存不存在: %s", THS_SELFSTOCK)
 
     if THS_XIADAN_DIR.is_dir():
         for f in sorted(THS_XIADAN_DIR.glob("selfstock_*.json")):
             _eat(f)
 
+    if not ok:
+        return None
     return out
 
 
-def read_positions() -> dict:
-    """持仓：从 v1 /api/positions 读（成本含费，OCR 已算好）。
-
-    返回 {code: {"code","name","qty","avail","cost","price","pnl","day_pnl"}}
-    v1 没跑或没持仓时返回空 dict，不抛异常。
-    """
+def read_positions():
+    """返回 {code: {...}}；v1 不可用返回 None（沿用上次，不误清空）。"""
     try:
         req = urllib.request.Request(V1_POSITIONS_URL, headers={"Accept": "application/json"})
         with urllib.request.urlopen(req, timeout=5) as r:
             j = json.loads(r.read().decode("utf-8"))
-    except Exception as e:
-        log.warning("v1 /api/positions 不可用（v1 没跑？）: %s", e)
-        return {}
+    except Exception as e:  # noqa: BLE001
+        log.warning("v1 /api/positions 不可用: %s", e)
+        return None
 
     out = {}
     for p in j.get("positions") or []:
-        c = (p.get("code") or "").strip()
+        c = str(p.get("code") or "").strip()
         if not is_a_stock(c):
             continue
         out[c] = {
@@ -193,6 +209,7 @@ def read_positions() -> dict:
             "frozen": float(p.get("frozen") or 0),
             "cost": float(p.get("avg_cost") or p.get("cost") or 0),
             "price": float(p.get("price") or 0),
+            "pct": float(p.get("pct") or 0),
             "pnl": float(p.get("pnl") or 0),
             "day_pnl": float(p.get("day_pnl") or 0),
             "pnl_pct": float(p.get("pnl_pct") or 0),
@@ -200,19 +217,12 @@ def read_positions() -> dict:
     return out
 
 
-# ---------------- TSP 侧：开放接口 ----------------
+# ---------------- TSP HTTP ----------------
 
 class TspClient:
-    """TSP 开放接口薄客户端。
-
-    端点契约由 TSP 自带：GET /api/openapi.json?tier=a
-    首次运行先 --discover 把端点清单打出来，再按下面的匹配规则确认落点。
-    """
-
-    def __init__(self, base: str, token: str):
+    def __init__(self, base: str, token: str = ""):
         self.base = base.rstrip("/")
         self.token = token
-        self._spec = None
 
     def _headers(self) -> dict:
         h = {"Accept": "application/json", "Content-Type": "application/json"}
@@ -229,217 +239,387 @@ class TspClient:
                 raw = r.read().decode("utf-8", errors="replace")
                 try:
                     return r.status, json.loads(raw) if raw else None
-                except Exception:
+                except Exception:  # noqa: BLE001
                     return r.status, raw
         except urllib.error.HTTPError as e:
-            body_txt = ""
+            txt = ""
             try:
-                body_txt = e.read().decode("utf-8", errors="replace")[:500]
-            except Exception:
+                txt = e.read().decode("utf-8", errors="replace")[:400]
+            except Exception:  # noqa: BLE001
                 pass
-            return e.code, body_txt
-        except Exception as e:
+            return e.code, txt
+        except Exception as e:  # noqa: BLE001
             return 0, str(e)
 
-    def openapi(self) -> dict:
-        if self._spec is not None:
-            return self._spec
-        code, j = self.request("GET", "/api/openapi.json?tier=a")
-        if code == 200 and isinstance(j, dict) and j.get("paths"):
-            self._spec = j
-        else:
-            self._spec = {}
-            log.warning("取 openapi 失败 code=%s resp=%s", code, str(j)[:200])
-        return self._spec
-
-    def find_paths(self, *keywords: str) -> list[str]:
-        """按关键词在 path + summary + tags 里找端点。"""
-        spec = self.openapi()
-        hits = []
-        for path, ops in (spec.get("paths") or {}).items():
-            blob = path.lower()
-            for _m, op in (ops or {}).items():
-                if isinstance(op, dict):
-                    blob += " " + str(op.get("summary", "")) + " " + str(op.get("tags", ""))
-            if all(k.lower() in blob for k in keywords):
-                hits.append(path)
-        return hits
-
-    def dump_endpoints(self) -> None:
-        spec = self.openapi()
-        paths = spec.get("paths") or {}
-        print("=" * 78)
-        print("TSP 端点清单（共 %d 条）— 把这份贴给 MOSS，用来锁定同步落点" % len(paths))
-        print("=" * 78)
-        for path in sorted(paths):
-            ops = paths[path] or {}
-            methods = ",".join(m.upper() for m in ops if m in ("get", "post", "put", "patch", "delete"))
-            summary = ""
-            for op in ops.values():
-                if isinstance(op, dict) and op.get("summary"):
-                    summary = op["summary"]
-                    break
-            print("%-8s %-52s %s" % (methods, path, summary))
-        print("=" * 78)
+    def ok(self, code: int) -> bool:
+        return code in (200, 201, 204)
 
 
-# ---------------- 同步逻辑 ----------------
-
-def sync_selfstock(cli: TspClient, codes: list[str], st: dict, dry: bool) -> bool:
-    """自选股同步。返回是否有变化。"""
-    prev = st.get("selfstock") or []
-    if prev == codes:
-        log.info("自选股无变化（%d 只），跳过", len(codes))
-        return False
-
-    added = [c for c in codes if c not in prev]
-    removed = [c for c in prev if c not in codes]
-    log.info("自选股变化：+%d -%d（共 %d 只）", len(added), len(removed), len(codes))
-    if dry:
-        log.info("[dry-run] 将推送自选股 %d 只: %s", len(codes), ",".join(codes[:10]))
-        return True
-
-    # 端点猜测顺序：订阅/自选/watchlist/favorite
-    tried = []
-    for kws in (("watchlist",), ("selfstock",), ("favorite",), ("订阅",), ("自选",)):
-        for path in cli.find_paths(*kws):
-            body = {"codes": codes, "symbols": codes, "items": codes}
-            code, resp = cli.request("POST", path, body)
-            tried.append((path, code))
-            if code in (200, 201, 204):
-                log.info("自选股已推送 → %s (%s)", path, code)
-                st["selfstock"] = codes
-                return True
-            if code == 404:
-                continue
-            log.warning("推 %s 返回 %s: %s", path, code, str(resp)[:200])
-            break
-    log.warning("自选股未推送：没找到可用端点。已尝试 %s", tried or "（openapi 为空）")
-    return False
+def ensure_group(cli: TspClient, groups: list[dict], name: str, color: str) -> tuple[str, list[dict]]:
+    """按名称找分组，没有就建。返回 (group_id, 最新分组列表)。"""
+    for g in groups:
+        if str(g.get("name") or "").strip() == name:
+            return g["id"], groups
+    code, resp = cli.request("POST", TSP_GROUPS, {"name": name, "color": color})
+    if cli.ok(code) and isinstance(resp, dict):
+        group = resp.get("group") or {}
+        if group.get("id"):
+            log.info("已建分组「%s」(%s)", name, group["id"])
+            return group["id"], resp.get("groups") or groups
+    # 400「分组名称已存在」等并发情况：重列一次
+    code, resp = cli.request("GET", TSP_GROUPS)
+    if cli.ok(code) and isinstance(resp, dict):
+        groups = resp.get("groups") or []
+        for g in groups:
+            if str(g.get("name") or "").strip() == name:
+                return g["id"], groups
+    raise RuntimeError(f"无法创建/找到分组「{name}」: {code} {str(resp)[:200]}")
 
 
-def sync_positions(cli: TspClient, pos: dict, st: dict, dry: bool) -> bool:
-    """持仓同步。持仓是"写数据"，TSP 走 write:ext 扩展表最稳。"""
-    prev = st.get("positions") or {}
-    if prev == pos:
-        log.info("持仓无变化（%d 只），跳过", len(pos))
-        return False
-
-    log.info("持仓变化：当前 %d 只 %s", len(pos), ",".join(sorted(pos)))
-    if dry:
-        for c, p in sorted(pos.items()):
-            log.info("[dry-run] %s %s qty=%.0f cost=%.3f price=%.2f pnl=%.0f",
-                     c, p.get("name"), p["qty"], p["cost"], p["price"], p["pnl"])
-        return True
-
-    rows = [
-        {
-            "code": p["code"], "name": p["name"], "qty": p["qty"], "avail": p["avail"],
-            "frozen": p["frozen"], "cost": p["cost"], "price": p["price"],
-            "pnl": p["pnl"], "day_pnl": p["day_pnl"], "pnl_pct": p["pnl_pct"],
-            "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        }
-        for p in pos.values()
-    ]
-
-    # 首选：扩展表写入（write:ext）
-    for path in cli.find_paths("ext") + cli.find_paths("扩展"):
-        if "get" in (cli.openapi().get("paths", {}).get(path) or {}):
+def sync_positions_to_groups(cli: TspClient, rows: list[dict], self_set: set[str],
+                             pos_set: set[str], gid_self: str, gid_pos: str) -> list[str]:
+    """把每个标的的分组归属对齐到两池；只打差异请求。返回操作日志。"""
+    actions: list[str] = []
+    owned = {gid_self, gid_pos}
+    for row in rows:
+        sym = str(row.get("symbol") or "")
+        if not sym:
             continue
-        for body in (
-            {"table": "hold_positions", "rows": rows},
-            {"table_name": "hold_positions", "rows": rows},
-            {"name": "hold_positions", "data": rows},
-            {"rows": rows},
-        ):
-            code, resp = cli.request("POST", path, body)
-            if code in (200, 201, 204):
-                log.info("持仓已写入扩展表 → %s (%s)", path, code)
-                st["positions"] = pos
-                return True
-        log.debug("扩展表写入失败 path=%s", path)
-
-    for kws in (("position",), ("holding",), ("持仓",)):
-        for path in cli.find_paths(*kws):
-            code, resp = cli.request("POST", path, {"positions": rows})
-            if code in (200, 201, 204):
-                log.info("持仓已推送 → %s (%s)", path, code)
-                st["positions"] = pos
-                return True
-            log.warning("推 %s 返回 %s: %s", path, code, str(resp)[:200])
-
-    log.warning("持仓未推送：没找到可用端点（先跑 --discover 把端点清单发出来）")
-    return False
+        have = set(row.get("group_ids") or [])
+        want: set[str] = set()
+        if sym in self_set:
+            want.add(gid_self)
+        if sym in pos_set:
+            want.add(gid_pos)
+        # 只接管本桥管理的两个分组，用户自己建的其他分组不动
+        stale = (have & owned) - want
+        fresh = want - have
+        for gid in fresh:
+            c, _ = cli.request("POST", f"{TSP_GROUPS}/{gid}/members/{sym}")
+            if cli.ok(c):
+                actions.append(f"+{sym}→{GROUP_SELF if gid == gid_self else GROUP_POS}")
+            else:
+                log.warning("加分组失败 %s %s: %s", sym, gid, c)
+        for gid in stale:
+            c, _ = cli.request("DELETE", f"{TSP_GROUPS}/{gid}/members/{sym}")
+            if cli.ok(c):
+                actions.append(f"-{sym}←{GROUP_SELF if gid == gid_self else GROUP_POS}")
+            else:
+                log.warning("摘分组失败 %s %s: %s", sym, gid, c)
+    return actions
 
 
-# ---------------- 主流程 ----------------
+# ---------------- 同步主流程 ----------------
 
-def run_once(cli: TspClient, cfg: dict, dry: bool) -> dict:
+def run_once(cli: TspClient, cfg: dict, dry: bool = False, force: bool = False) -> dict:
     st = load_state()
-    changed = {"selfstock": False, "positions": False}
+    t0 = time.time()
+    result = {
+        "ok": False, "dry": dry, "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "selfstock": [], "positions": [], "added": [], "removed": [],
+        "group_actions": [], "errors": [], "elapsed_ms": 0,
+    }
 
-    if cfg.get("sync_selfstock", True):
-        codes = read_selfstock()
-        if codes:
-            changed["selfstock"] = sync_selfstock(cli, codes, st, dry)
+    # 1) 读两端；读不到就沿用上次，绝不误清空
+    self_codes = read_selfstock() if cfg.get("sync_selfstock", True) else []
+    pos = read_positions() if cfg.get("sync_positions", True) else {}
+    if self_codes is None:
+        self_codes = st.get("selfstock") or []
+        result["errors"].append("同花顺自选缓存暂不可读，沿用上次快照")
+    if pos is None:
+        pos = st.get("positions") or {}
+        result["errors"].append("v1 持仓接口暂不可用，沿用上次快照")
+
+    self_set = set(self_codes)
+    pos_set = set(pos)
+    desired = list(dict.fromkeys(list(self_codes) + list(pos_set)))
+    result["selfstock"] = self_codes
+    result["positions"] = [
+        {"code": c, "name": p["name"], "qty": p["qty"], "cost": round(p["cost"], 3),
+         "price": p["price"], "pnl": round(p["pnl"], 2), "pnl_pct": round(p["pnl_pct"], 2)}
+        for c, p in sorted(pos.items())
+    ]
+    log.info("读到 自选 %d 只 / 持仓 %d 只 / 合并 %d 只", len(self_set), len(pos_set), len(desired))
+
+    if dry:
+        result["ok"] = True
+        result["elapsed_ms"] = int((time.time() - t0) * 1000)
+        log.info("[dry-run] 将同步 %d 只，不写入 TSP", len(desired))
+        return result
+
+    if not desired:
+        result["errors"].append("两端都为空，跳过本轮（防止误清空 TSP）")
+        result["elapsed_ms"] = int((time.time() - t0) * 1000)
+        return result
+
+    # 2) TSP 现状
+    code, resp = cli.request("GET", TSP_WATCHLIST)
+    if not cli.ok(code) or not isinstance(resp, dict):
+        result["errors"].append(f"读 TSP 自选失败: {code} {str(resp)[:160]}")
+        result["elapsed_ms"] = int((time.time() - t0) * 1000)
+        return result
+    cur_rows = resp.get("symbols") or []
+    cur_map = {str(r.get("symbol") or ""): r for r in cur_rows}
+    owned_now = {s for s, r in cur_map.items() if NOTE in str(r.get("note") or "")}
+
+    # 3) 两个分组
+    code, gresp = cli.request("GET", TSP_GROUPS)
+    groups = (gresp.get("groups") or []) if (cli.ok(code) and isinstance(gresp, dict)) else []
+    try:
+        gid_self, groups = ensure_group(cli, groups, GROUP_SELF, COLOR_SELF)
+        gid_pos, groups = ensure_group(cli, groups, GROUP_POS, COLOR_POS)
+    except Exception as e:  # noqa: BLE001
+        result["errors"].append(str(e))
+        result["elapsed_ms"] = int((time.time() - t0) * 1000)
+        return result
+    result["groups"] = {GROUP_SELF: gid_self, GROUP_POS: gid_pos}
+
+    # 4) 删除本桥以前写、现在不在两池中的标的（用户手动加的绝不删）
+    for s in sorted(owned_now - set(desired)):
+        c, _ = cli.request("DELETE", f"{TSP_WATCHLIST}/{s}")
+        if cli.ok(c):
+            result["removed"].append(s)
+            log.info("移除过期标的 %s", s)
         else:
-            log.warning("自选股读到 0 只 —— 同花顺没启动过或缓存为空")
+            log.warning("移除 %s 失败: %s", s, c)
 
-    if cfg.get("sync_positions", True):
-        pos = read_positions()
-        if pos:
-            changed["positions"] = sync_positions(cli, pos, st, dry)
+    # 5) 新增标的（按两池归属分 3 批，避免 80 只每 60 秒重排整个列表）
+    buckets: dict[tuple, list[str]] = {}
+    for s in desired:
+        if s in cur_map:
+            continue
+        key = (s in self_set, s in pos_set)
+        buckets.setdefault(key, []).append(s)
+    for (in_self, in_pos), syms in buckets.items():
+        gids = []
+        if in_self:
+            gids.append(gid_self)
+        if in_pos:
+            gids.append(gid_pos)
+        c, _ = cli.request("POST", TSP_BATCH, {"symbols": syms, "note": NOTE, "group_ids": gids})
+        if cli.ok(c):
+            result["added"].extend(syms)
+            log.info("新增 %d 只 → TSP（分组 %s）", len(syms), gids)
         else:
-            log.warning("持仓读到 0 只 —— v1 服务没跑或确实空仓")
+            msg = f"批量新增失败 {syms[:3]}...: {c}"
+            result["errors"].append(msg)
+            log.warning(msg)
 
-    if not dry and any(changed.values()):
-        st["ts"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        save_state(st)
-    return changed
+    # 6) 对齐分组归属（含用户手动加过、后来进入同花顺自选的标的）
+    code, resp2 = cli.request("GET", TSP_WATCHLIST)
+    rows2 = (resp2.get("symbols") or []) if (cli.ok(code) and isinstance(resp2, dict)) else cur_rows
+    targets = [r for r in rows2 if str(r.get("symbol") or "") in set(desired)]
+    result["group_actions"] = sync_positions_to_groups(
+        cli, targets, self_set, pos_set, gid_self, gid_pos
+    )
 
+    # 7) 落状态
+    st["selfstock"] = self_codes
+    st["positions"] = pos
+    st["ts"] = result["ts"]
+    st["last_result"] = {k: v for k, v in result.items() if k != "positions"}
+    save_state(st)
+
+    result["ok"] = not result["errors"]
+    result["elapsed_ms"] = int((time.time() - t0) * 1000)
+    _RUNTIME["last_sync"] = result["ts"]
+    _RUNTIME["last_result"] = result
+    _RUNTIME["sync_count"] += 1
+    log.info("同步完成：+%d -%d，分组调整 %d 项，耗时 %dms",
+             len(result["added"]), len(result["removed"]),
+             len(result["group_actions"]), result["elapsed_ms"])
+    return result
+
+
+def discover(cli: TspClient) -> None:
+    for label, path in (("health", TSP_HEALTH), ("watchlist", TSP_WATCHLIST), ("groups", TSP_GROUPS)):
+        c, r = cli.request("GET", path, timeout=5)
+        print(f"--- {label} GET {path} -> {c}")
+        print(json.dumps(r, ensure_ascii=False)[:800])
+    print("--- write contract: POST /api/watchlist/batch {symbols,note,group_ids}")
+
+
+# ---------------- 本地按钮服务 ----------------
+
+class BridgeHandler(BaseHTTPRequestHandler):
+    cli: TspClient = None
+    cfg: dict = {}
+
+    def log_message(self, fmt, *args):
+        log.debug("HTTP %s", fmt % args)
+
+    def _cors(self):
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Max-Age", "86400")
+
+    def _send(self, code: int, payload):
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self._cors()
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self._cors()
+        self.end_headers()
+
+    def do_GET(self):
+        path = self.path.split("?")[0]
+        if path in ("/", "/api/health"):
+            self._send(200, {"ok": True, "service": "ths-tsp-sync-bridge", "version": 2})
+        elif path == "/api/status":
+            self._send(200, self._status())
+        else:
+            self._send(404, {"ok": False, "error": "not found"})
+
+    def do_POST(self):
+        path = self.path.split("?")[0]
+        if path == "/api/sync":
+            with _RUNTIME["lock"]:
+                try:
+                    res = run_once(self.cli, self.cfg, dry=False, force=True)
+                except Exception as e:  # noqa: BLE001
+                    log.exception("按钮同步失败")
+                    res = {"ok": False, "errors": [f"{type(e).__name__}: {e}"]}
+            self._send(200 if res.get("ok") else 500, res)
+        else:
+            self._send(404, {"ok": False, "error": "not found"})
+
+    def _status(self):
+        cli = self.cli
+        c, r = cli.request("GET", TSP_HEALTH, timeout=5)
+        tsp_ok = cli.ok(c)
+        c2, r2 = cli.request("GET", TSP_WATCHLIST, timeout=5)
+        wl = (r2.get("symbols") or []) if (cli.ok(c2) and isinstance(r2, dict)) else []
+        c3, r3 = cli.request("GET", TSP_GROUPS, timeout=5)
+        groups = (r3.get("groups") or []) if (cli.ok(c3) and isinstance(r3, dict)) else []
+        last = _RUNTIME.get("last_result") or {}
+        return {
+            "ok": True,
+            "bridge": {"version": 2, "auto": _RUNTIME["auto"],
+                       "interval": _RUNTIME["interval"],
+                       "started_at": _RUNTIME["started_at"],
+                       "sync_count": _RUNTIME["sync_count"],
+                       "last_sync": _RUNTIME["last_sync"]},
+            "tsp": {"online": tsp_ok, "base": cli.base,
+                    "version": (r or {}).get("version") if isinstance(r, dict) else "",
+                    "watchlist_count": len(wl),
+                    "groups": [{"id": g.get("id"), "name": g.get("name")} for g in groups]},
+            "sources": {
+                "selfstock_count": len(last.get("selfstock") or []),
+                "positions_count": len(last.get("positions") or []),
+                "positions": last.get("positions") or [],
+                "selfstock": last.get("selfstock") or [],
+            },
+            "last_result": last,
+        }
+
+
+def serve_forever(cli: TspClient, cfg: dict, auto: bool) -> None:
+    _RUNTIME["auto"] = auto
+    _RUNTIME["interval"] = int(cfg.get("interval") or 60)
+    BridgeHandler.cli = cli
+    BridgeHandler.cfg = cfg
+    host = cfg.get("bridge_host") or "127.0.0.1"
+    port = int(cfg.get("bridge_port") or 17652)
+    server = ThreadingHTTPServer((host, port), BridgeHandler)
+    server.daemon_threads = True
+    log.info("按钮服务已监听 http://%s:%d （auto=%s, interval=%ss）", host, port,
+             auto, _RUNTIME["interval"])
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+
+    if auto:
+        def _loop():
+            # 启动即先跑一轮，之后每 interval 秒一轮
+            while True:
+                with _RUNTIME["lock"]:
+                    try:
+                        run_once(cli, cfg, dry=False)
+                    except Exception as e:  # noqa: BLE001
+                        log.exception("自动同步本轮失败: %s", e)
+                time.sleep(_RUNTIME["interval"])
+        threading.Thread(target=_loop, daemon=True, name="auto-sync").start()
+
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        log.info("收到 Ctrl-C，退出")
+        server.shutdown()
+
+
+# ---------------- 开机自启 ----------------
+
+def install_autostart() -> int:
+    pyw = Path(r"C:\Python314\pythonw.exe")
+    if not pyw.exists():
+        pyw = Path(sys.executable).with_name("pythonw.exe")
+    script = Path(__file__).resolve()
+    startup = Path(os.environ.get("APPDATA", "")) / \
+        "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
+    startup.mkdir(parents=True, exist_ok=True)
+    vbs = startup / "ths_tsp_sync.vbs"
+    cmd = f'"{pyw}" "{script}" --loop'
+    body = (
+        "' 同花顺 → TSP 同步桥：隐藏窗口启动，零 UI 模拟、不抢焦点\n"
+        "Set sh = CreateObject(\"WScript.Shell\")\n"
+        f'sh.CurrentDirectory = "{script.parent}"\n'
+        'sh.Run "' + cmd.replace('"', '""') + '", 0, False\n'
+    )
+    vbs.write_text(body, encoding="utf-8")
+    print(f"已写入启动项: {vbs}")
+    print(f"启动命令: {cmd}")
+    print(f"删除该文件即可取消开机自启")
+    return 0
+
+
+# ---------------- CLI ----------------
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="同花顺远航版 → TSP 同步桥（只读文件 + HTTP，不抢焦点）")
     ap.add_argument("--once", action="store_true", help="跑一轮就退出（一键同步）")
-    ap.add_argument("--loop", action="store_true", help="常驻轮询（默认 60 秒）")
+    ap.add_argument("--loop", action="store_true", help="自动轮询 + 本地按钮服务（推荐）")
+    ap.add_argument("--serve", action="store_true", help="只起本地按钮服务，不自动轮询")
     ap.add_argument("--interval", type=int, default=0, help="轮询间隔秒，覆盖配置")
-    ap.add_argument("--dry-run", action="store_true", help="只读不推，看读到了什么")
-    ap.add_argument("--discover", action="store_true", help="打印 TSP 端点清单后退出")
+    ap.add_argument("--dry-run", action="store_true", help="只读不写，打印将同步什么")
+    ap.add_argument("--discover", action="store_true", help="打印 TSP 自选/分组现状")
+    ap.add_argument("--install", action="store_true", help="写入 Windows 开机自启（隐藏窗口）")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
     setup_log(args.verbose)
+    if args.install:
+        return install_autostart()
+
     cfg = load_config()
+    if args.interval:
+        cfg["interval"] = args.interval
     cli = TspClient(cfg["tsp_base"], cfg.get("token") or "")
 
     if args.discover:
-        cli.dump_endpoints()
+        discover(cli)
         return 0
 
-    # 先探活
-    code, _ = cli.request("GET", "/api/health", timeout=5)
-    if code == 0:
-        log.error("连不上 TSP：%s（Docker/桌面端起了吗？）", cfg["tsp_base"])
+    code, _ = cli.request("GET", TSP_HEALTH, timeout=5)
+    if not cli.ok(code):
+        log.error("连不上 TSP：%s（桌面端/服务起了吗？health=%s）", cfg["tsp_base"], code)
         return 2
-    log.info("TSP 在线 %s (health=%s)", cfg["tsp_base"], code)
-    if not (cfg.get("token") or ""):
-        log.warning("token 为空 —— 去 TSP「设置 → 开放接口」建一个，填进 %s", CONFIG_PATH)
-        if not args.dry_run:
-            return 3
+    log.info("TSP 在线 %s", cfg["tsp_base"])
 
-    if args.loop:
-        interval = args.interval or int(cfg.get("interval") or 60)
-        log.info("进入轮询模式，间隔 %d 秒（Ctrl-C 退出）", interval)
-        while True:
-            try:
-                run_once(cli, cfg, args.dry_run)
-            except Exception as e:
-                log.exception("本轮失败: %s", e)
-            time.sleep(interval)
+    if args.loop or args.serve:
+        serve_forever(cli, cfg, auto=args.loop)
+        return 0
 
-    run_once(cli, cfg, args.dry_run)
-    log.info("完成。")
-    return 0
+    res = run_once(cli, cfg, dry=args.dry_run)
+    print(json.dumps({k: v for k, v in res.items() if k not in ("positions", "selfstock")},
+                     ensure_ascii=False, indent=2))
+    return 0 if res.get("ok") else 1
 
 
 if __name__ == "__main__":

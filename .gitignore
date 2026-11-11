@@ -88,6 +88,16 @@ docs/zhihu/
 # ===== 用户自定义策略(私有,不开源) =====
 data/strategies/custom/
 
+# ===== 同花顺同步桥：本地运行时文件(含自选股/持仓快照, 不入库) =====
+tools/ths_tsp_sync.json
+tools/ths_tsp_sync.state.json
+tools/ths_tsp_sync.log
+tools/_tsp_shot.png
+
+# ===== 页面插件模板：本地 pnpm 副产物(不入库) =====
+frontend/page-pack-template/pnpm-lock.yaml
+frontend/page-pack-template/pnpm-workspace.yaml
+
 # ===== 临时 / 调试产物 =====
 backend._recheck*.py
 backend/_verify*.py
