@@ -73,6 +73,7 @@ from typing import Any
 from app.services import watchlist
 
 from . import reader
+from . import xd_screen
 from . import writer
 
 logger = logging.getLogger(__name__)
@@ -233,6 +234,76 @@ def update_state(patch: dict[str, Any]) -> dict[str, Any]:
 # ---------------------------------------------------------------- 分组工具
 
 
+_SCREEN_CACHE: dict[str, Any] = {"ts": 0.0, "positions": None, "note": ""}
+_SCREEN_TTL = 4.0   # 秒；前端每 10s 轮询一次，缓存免得每次都开 tesseract
+
+
+def _positions_from_screen() -> tuple[list[reader.Position] | None, str]:
+    """屏幕 OCR 兜底读持仓。返回 (持仓, 说明)。
+
+    为什么要这条通道
+    ----------------
+    精确持仓的同花顺进程内来源只有 ``g_position``，必须靠 ``ths_agent.py``
+    在「Python策略编辑器」里人工跑一次才通（监听 17660）。但那一步
+    BOSS 每重启一次同花顺就得重做一次，等于持仓永远在半自动状态。
+
+    ``xiadan.exe`` 的下单端窗口本身就把完整持仓画在屏幕上（证券代码 /
+    股票余额 / 可用余额 / 成本价 / 市价 / 持仓盈亏 / 盈亏比例 / 当日盈亏 /
+    当日盈亏比 / 市值），所以 ``xd_screen`` 用后台 BitBlt + 逐列 OCR
+    把这张表读回来——完全不抢前台、不需要脚本、不需要人工。
+
+    代理活着时仍然优先用代理（``cbj`` 是券商回报口径，含费用）；代理不可用
+    才降级走屏幕。两条通道的 ``cost`` 都是含费成本，语义一致。
+    """
+    now = time.time()
+    if now - float(_SCREEN_CACHE.get("ts") or 0) < _SCREEN_TTL:
+        return _SCREEN_CACHE.get("positions"), str(_SCREEN_CACHE.get("note") or "")
+    try:
+        snap = xd_screen.snapshot()
+    except Exception as exc:  # snapshot 本身不抛，这里只是双保险
+        return None, "屏幕读取异常：%s" % exc
+    if not snap.get("ok"):
+        return None, str(snap.get("error") or "屏幕读取失败")
+    out: list[reader.Position] = []
+    for row in snap.get("positions") or []:
+        code = str(row.get("code") or "")
+        if not reader.is_a_stock(code):
+            continue
+        qty = float(row.get("qty") or 0)
+        if qty <= 0:
+            continue
+        out.append(
+            reader.Position(
+                code=code,
+                name=str(row.get("name") or ""),
+                qty=qty,
+                avail=float(row.get("avail") or 0),
+                cost=float(row.get("cost") or 0),
+                price=float(row.get("price") or 0),
+                market_value=float(row.get("market_value") or 0),
+                pnl=float(row.get("pnl") or 0),
+            )
+        )
+    out.sort(key=lambda p: p.code)
+    if not out:
+        _SCREEN_CACHE.update({"ts": now, "positions": None, "note": "屏幕没读出持仓行"})
+        return None, "屏幕没读出持仓行"
+    _SCREEN_CACHE.update({"ts": now, "positions": out, "note": "screen"})
+    return out, "screen"
+
+
+def read_positions_any() -> tuple[list[reader.Position] | None, str]:
+    """读持仓：进程内代理优先，不可用时降级到下单端屏幕 OCR。"""
+    try:
+        positions = reader.read_positions()
+    except Exception as exc:
+        logger.info("代理读持仓异常：%s", exc)
+        positions = None
+    if positions is not None:
+        return positions, "agent"
+    return _positions_from_screen()
+
+
 def _ensure_group(name: str, color: str) -> tuple[str | None, str]:
     """确保分组存在，返回 (group_id, 说明)。"""
     groups = watchlist.list_groups()
@@ -319,6 +390,7 @@ def run_once(
         "group_actions": [],
         "block": None,
         "selfstock_write": None,
+        "positions_channel": "",
         "skipped": [],
         "errors": [],
         "elapsed_ms": 0,
@@ -350,10 +422,11 @@ def run_once(
     # ---- 读同花顺持仓（只在手动一键同步时读）
     positions: list[reader.Position] | None = None
     if want_positions:
-        positions = reader.read_positions()
+        positions, channel = read_positions_any()
+        result["positions_channel"] = channel if positions is not None else ""
         if positions is None:
             result["skipped"].append(
-                "持仓读取失败（同花顺未运行或持仓代理未启动），本轮保留 TSP 现有持仓条目"
+                "持仓读取失败（%s），本轮保留 TSP 现有持仓条目" % channel
             )
         else:
             result["positions"] = len(positions)
@@ -390,8 +463,12 @@ def run_once(
     desired_pos: set[str] = {p.code for p in (positions or [])} if want_apply else set()
     desired_all = desired_self | desired_pos
 
-    # 本轮没读到的那一路，其原有条目保留，不能因为 None 被当成空集删掉
-    keep: set[str] = set()
+    # 本轮没读到的那一路，其原有条目保留，不能因为 None 被当成空集删掉。
+    # 两条通道各自独立保留：曾经用一个 keep 混着装，结果是「同花顺自选」的 40 多只
+    # 被塞进「同花顺持仓」分组（_sync_group_members 是强制对齐语义），
+    # 持仓池直接变成自选池的副本。
+    keep_self: set[str] = set()
+    keep_pos: set[str] = set()
     groups_now = {str(g.get("id") or ""): g for g in watchlist.list_groups()}
     if self_codes_native is None:
         group_self_id = None
@@ -400,7 +477,7 @@ def run_once(
                 group_self_id = gid
                 break
         if group_self_id:
-            keep |= _group_members(current_rows, group_self_id)
+            keep_self |= _group_members(current_rows, group_self_id)
     if positions is None:
         group_pos_id = None
         for gid, g in groups_now.items():
@@ -408,9 +485,9 @@ def run_once(
                 group_pos_id = gid
                 break
         if group_pos_id:
-            keep |= _group_members(current_rows, group_pos_id)
+            keep_pos |= _group_members(current_rows, group_pos_id)
 
-    desired_effective = desired_all | keep
+    desired_effective = desired_all | keep_self | keep_pos
 
     # ---- 写 TSP：新增
     to_add_self = sorted(desired_self - set(current))
@@ -467,8 +544,8 @@ def run_once(
                     pass
 
         # 校正两个分组的成员集合（把不该在的移出去）
-        _sync_group_members(group_self_id, desired_self | keep, result["group_actions"])
-        _sync_group_members(group_pos_id, desired_pos | keep, result["group_actions"])
+        _sync_group_members(group_self_id, desired_self | keep_self, result["group_actions"])
+        _sync_group_members(group_pos_id, desired_pos | keep_pos, result["group_actions"])
     else:
         result["added"] = to_add
         result["removed"] = to_remove
@@ -688,8 +765,17 @@ def build_status() -> dict[str, Any]:
 
     agent_ok = reader.agent_alive()
     positions: list[reader.Position] = []
+    positions_channel = ""
     if agent_ok:
         positions = reader.read_positions() or []
+        if positions:
+            positions_channel = "agent"
+    if not positions:
+        # 代理没起时不要空着——下单端窗口上就有持仓表，屏幕 OCR 兜底
+        screen_positions, channel = _positions_from_screen()
+        if screen_positions:
+            positions = screen_positions
+            positions_channel = channel
 
     self_codes = reader.read_selfstock(user) if user else None
 
@@ -752,7 +838,8 @@ def build_status() -> dict[str, Any]:
             "selfstock_ok": self_codes is not None,
             "selfstock_count": len(self_codes or []),
             "agent_ok": agent_ok,
-            "positions_ok": agent_ok,
+            "positions_ok": bool(positions),
+            "positions_channel": positions_channel,
             "positions_count": len(positions),
             "block_name": block_name,
             "block_count": len(block_codes or []) if block_codes is not None else None,

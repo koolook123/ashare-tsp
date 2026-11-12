@@ -104,6 +104,7 @@ interface Status {
     selfstock_count: number
     agent_ok: boolean
     positions_ok: boolean
+    positions_channel: string
     positions_count: number
     block_name: string
     block_count: number | null
@@ -398,9 +399,11 @@ export function ThsSync() {
                   tone={data.ths.selfstock_ok ? undefined : 'text-warning'}
                 />
                 <Metric
-                  label="持仓代理"
-                  value={data.ths.agent_ok ? `${data.ths.positions_count} 只` : '未运行'}
-                  tone={data.ths.agent_ok ? undefined : 'text-warning'}
+                  label={data.ths.positions_channel === 'screen' ? '持仓（屏幕识别）' : '持仓（进程内）'}
+                  value={
+                    data.ths.positions_ok ? `${data.ths.positions_count} 只` : '读不到'
+                  }
+                  tone={data.ths.positions_ok ? undefined : 'text-warning'}
                 />
                 <Metric
                   label={`板块 ${data.ths.block_name}`}
@@ -434,13 +437,18 @@ export function ThsSync() {
                   SelfStockCache.json，稳定可用，跟随「自动同步」开关每轮自动跑。
                 </li>
                 <li>
-                  · <span className="text-secondary">持仓 → TSP</span>：磁盘上没有任何持仓快照，
-                  只能由同花顺进程内代理（127.0.0.1:17660）提供。
-                  <span className="text-warning">本版已取消自动持仓同步</span>，
-                  改为右上角「一键同步持仓」手动触发；代理未运行时沿用上次快照，绝不清空。
-                  {!data.ths.agent_ok && (
+                  · <span className="text-secondary">持仓 → TSP</span>：磁盘上没有持仓快照，但有两条读法。
+                  首选同花顺进程内代理（127.0.0.1:17660，取 g_position 的含费成本 cbj）；
+                  代理没起时自动降级为<span className="text-accent">后台截屏识别下单端的持仓表</span>
+                  （BitBlt + 逐列 OCR，不抢前台、不需要脚本）。
+                  <span className="text-warning">持仓不做自动同步</span>，只在右上角
+                  「一键同步持仓」时读一次；两路都读不到时沿用上次快照，绝不清空。
+                  {!data.ths.agent_ok && data.ths.positions_ok && (
+                    <span className="text-muted">（当前走屏幕识别通道）</span>
+                  )}
+                  {!data.ths.positions_ok && (
                     <span className="text-warning">
-                      {' '}当前代理未运行——到同花顺「我的策略」里运行 ths_agent.py 即可常驻。
+                      {' '}当前两路都读不到——打开同花顺下单端并停在持仓页即可。
                     </span>
                   )}
                 </li>

@@ -4,18 +4,19 @@
 
 - 上游项目：tick-stock-panel，作者/维护者 shy3130，许可证 MIT。
 - 上游版权声明与许可全文见仓库根目录 `LICENSE`，本分支完整保留，未作修改。
-- 派生版本标记：`v0.3.34-koolook.6`（基于 upstream `v0.3.34`）。
+- 派生版本标记：`v0.3.34-koolook.7`（基于 upstream `v0.3.34`）。
 
-## 本分支新增内容（v0.3.34-koolook.6）
+## 本分支新增内容（v0.3.34-koolook.7）
 
 ### 一、源码级后端扩展（进程内，直连同花顺远航版本机安装）
 
 - `backend/app/custom/ths_sync/__init__.py`：扩展入口，`EXTENSION_ID = "koolook.ths-sync"`
+- `backend/app/custom/ths_sync/xd_screen.py`：后台 `BitBlt` 截屏 + 逐列裁条 OCR，读下单端持仓表与资金区（不抢前台、不需要在同花顺里运行脚本）
 - `backend/app/custom/ths_sync/reader.py`：定位同花顺用户目录、读自选缓存、读板块成分、经 `127.0.0.1:17660` 读持仓
 - `backend/app/custom/ths_sync/writer.py`：局部替换写板块（保留 `<hevo>` 私有属性）、原子写、写前备份、写后回读校验、写自选缓存、`ths_running()` 客户端运行探测
-- `backend/app/custom/ths_sync/service.py`：双向同步引擎 + 待写入队列 + 写自选主通道 + `with_positions` 三态 + 后台守护线程
+- `backend/app/custom/ths_sync/service.py`：双向同步引擎 + 待写入队列 + 写自选主通道 + 持仓双通道（代理 / 屏幕识别）+ `with_positions` 三态 + 后台守护线程
 - `backend/app/custom/ths_sync/routes.py`：`/api/custom/ths-sync` 下的 `status` / `sync` / `sync/dry` / `sync/positions` / `config` / `preview` / `blocks` / `agent`
-- `backend/app/custom/ths_sync/ths_agent.py`：跑在同花顺内置 Python 3.5 + IronPython 环境里的只读代理（`from ths_api import *` 取 `g_position` / `g_money`）
+- `backend/app/custom/ths_sync/ths_agent.py`：跑在同花顺内置 Python 3.5 + IronPython 环境里的只读代理（`from ths_api import *` 取 `g_position` / `g_money`），**`.7` 起为可选通道**，不运行也能读到持仓
 
 通过上游既有的后端扩展契约（`EXTENSION_ID` + `EXTENSION_API_VERSION` + `setup(registrar)` + 可选 `startup(context)`）挂载，
 不改动 `backend/app/main.py`、`backend/app/services/watchlist.py` 或任何核心业务模块。
@@ -58,3 +59,15 @@
 - 修复 `.5` 中「写入集合把自己算进去、下一轮又被整体排除」导致一次同步清空两边数据的级联 bug；
   写自选改为只做加法，并新增「来源读取失败即跳过」的第三条硬保护。
 - `ths_sync_state.json` 引入 `state_version`，`v1 → v2` 一次性迁移上述默认值。
+
+## v0.3.34-koolook.7 变更摘要
+
+- 新增 `backend/app/custom/ths_sync/xd_screen.py`：后台截屏（`PrintWindow` 全黑时回退 `BitBlt`）+ 逐列裁条
+  OCR（`tessedit_char_whitelist=0123456789.-`），读下单端持仓表与资金区；不抢前台、不模拟输入、
+  不需要在同花顺内置 Python 里运行脚本。
+- `service.read_positions_any()`：持仓读取双通道，代理（17660）优先、屏幕识别自动降级；
+  `GET /status` 与 `POST /sync/positions` 新增 `positions_channel`（`agent` / `screen`）。
+- `ths.positions_ok` 语义改为「本轮是否真读到持仓」，不再等同「代理是否在线」。
+- 修复分组污染：`keep` 单集合被两路混装，导致持仓组被写成自选组的全量副本；拆为
+  `keep_self` / `keep_pos` 后各分组只用自己的保留集。
+- 页面「持仓代理」指标改为「持仓（进程内）」/「持仓（屏幕识别）」，并在边界说明里写明两条读法与降级行为。
