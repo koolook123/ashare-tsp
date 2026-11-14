@@ -90,23 +90,63 @@ def ths_running() -> bool:
     写文件通道对「运行中」和「已关闭」的语义完全不同：
     运行中写进去会被内存态在数分钟内整份覆盖；关闭时写的会在下次启动被读入。
     所以每次写之前必须先判这个，把真实后果告诉调用方和界面。
+
+    这里只用 ctypes 调 Win32 Toolhelp 快照枚举进程名：零子进程、零控制台窗口、
+    不抢前台。过去用外部命令 Get-Process 会每轮弹黑框并夺走 BOSS 的焦点。
     """
     try:
-        import subprocess
+        import ctypes
+        from ctypes import wintypes
 
-        out = subprocess.run(
-            [
-                "powershell",
-                "-NoProfile",
-                "-Command",
-                "(Get-Process happ,xiadan,xiadan-plus -ErrorAction SilentlyContinue "
-                "| Measure-Object).Count",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=8,
-        )
-        return int((out.stdout or "0").strip() or 0) > 0
+        TH32CS_SNAPPROCESS = 0x00000002
+        MAX_PATH = 260
+
+        class PROCESSENTRY32W(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", ctypes.c_long),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", wintypes.WCHAR * MAX_PATH),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        CreateToolhelp32Snapshot = kernel32.CreateToolhelp32Snapshot
+        CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        Process32FirstW = kernel32.Process32FirstW
+        Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+        Process32FirstW.restype = wintypes.BOOL
+        Process32NextW = kernel32.Process32NextW
+        Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+        Process32NextW.restype = wintypes.BOOL
+        CloseHandle = kernel32.CloseHandle
+        CloseHandle.argtypes = [wintypes.HANDLE]
+        CloseHandle.restype = wintypes.BOOL
+
+        targets = {"happ.exe", "xiadan.exe", "xiadan-plus.exe"}
+        snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        if snap == wintypes.HANDLE(-1).value or not snap:
+            return True
+        try:
+            entry = PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+            ok = Process32FirstW(snap, ctypes.byref(entry))
+            while ok:
+                name = str(entry.szExeFile or "").casefold()
+                if name in targets:
+                    return True
+                entry = PROCESSENTRY32W()
+                entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+                ok = Process32NextW(snap, ctypes.byref(entry))
+            return False
+        finally:
+            CloseHandle(snap)
     except Exception:  # noqa: BLE001 - 探测失败时按「可能在运行」保守处理
         return True
 

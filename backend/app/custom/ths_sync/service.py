@@ -104,7 +104,14 @@ STATE_FILENAME = "ths_sync_state.json"
 #: v1：sync_positions=True（自动读持仓）、sync_tsp_to_ths=True（写板块）、
 #:     write_ths_selfstock=False（写自选默认关）
 #: v2：持仓改手动、板块写入关闭、写自选打开（自选成为 TSP → 同花顺 的主通道）
-STATE_VERSION = 2
+STATE_VERSION = 3
+
+# v3：同花顺板块成分也汇入 TSP；所有入池标的必须是 canonical symbol，
+# 否则 TSP 原生个股预览（stockPreviewStore）会拒绝裸 6 位码。
+NOTE_BLOCK = "同花顺板块"
+SYNC_NOTES = (NOTE, NOTE_BLOCK)
+GROUP_BLOCK_PREFIX = "同花顺·"
+
 
 _RUNTIME: dict[str, Any] = {
     "started_at": "",
@@ -293,15 +300,13 @@ def _positions_from_screen() -> tuple[list[reader.Position] | None, str]:
 
 
 def read_positions_any() -> tuple[list[reader.Position] | None, str]:
-    """读持仓：进程内代理优先，不可用时降级到下单端屏幕 OCR。"""
-    try:
-        positions = reader.read_positions()
-    except Exception as exc:
-        logger.info("代理读持仓异常：%s", exc)
-        positions = None
+    """读持仓：进程内代理（17660）优先，其次下单端屏幕 OCR 兜底。"""
+    positions = reader.read_positions()
     if positions is not None:
         return positions, "agent"
     return _positions_from_screen()
+
+
 
 
 def _ensure_group(name: str, color: str) -> tuple[str | None, str]:
@@ -363,6 +368,45 @@ def _sync_group_members(
 
 
 # ---------------------------------------------------------------- 主流程
+
+
+def _is_sync_note(note: Any) -> bool:
+    """同步来源标的（自选 / 持仓 / 板块）都用这两个 note 标记。"""
+    text = str(note or "")
+    return any(n in text for n in SYNC_NOTES)
+
+
+def _block_group_name(block: str) -> str:
+    return GROUP_BLOCK_PREFIX + str(block or "").strip()
+
+
+def _normalize_current_keys(current: dict[str, dict]) -> dict[str, dict]:
+    """把池子里历史遗留的裸 6 位码映射成 canonical key（不改行本身）。"""
+    out: dict[str, dict] = {}
+    for sym, row in current.items():
+        out[reader.to_tsp_symbol(sym) or sym] = row
+    return out
+
+
+def _canonicalize_existing() -> list[str]:
+    """一次性把 TSP 自选池里的裸码历史条目改成 canonical（保留 note / 分组）。"""
+    rows = watchlist.list_symbols()
+    existing = {str(r.get("symbol") or "") for r in rows}
+    actions: list[str] = []
+    for row in rows:
+        sym = str(row.get("symbol") or "")
+        canon = reader.to_tsp_symbol(sym)
+        if not canon or canon == sym:
+            continue
+        note = str(row.get("note") or "")
+        gids = list(row.get("group_ids") or [])
+        watchlist.remove(sym)
+        if canon not in existing:
+            watchlist.add_batch([canon], note=note, group_ids=gids or None)
+        actions.append("canonicalize %s: %s→%s" % (note or "native", sym, canon))
+    if actions:
+        logger.info("自选池裸码自愈 %d 只", len(actions))
+    return actions
 
 
 def run_once(
@@ -443,11 +487,22 @@ def run_once(
         return result
 
     current = {str(r.get("symbol") or ""): r for r in current_rows}
+    if not dry:
+        try:
+            canon_actions = _canonicalize_existing()
+            result["group_actions"].extend(canon_actions)
+            current_rows = watchlist.list_symbols()
+            current = {str(r.get("symbol") or ""): r for r in current_rows}
+        except Exception as exc:
+            result["errors"].append("代码口径自愈失败，本轮跳过同步：%s" % exc)
+            _record(result)
+            return result
+    current = _normalize_current_keys(current)
     result["tsp_watchlist"] = len(current)
     owned = {
         sym
         for sym, row in current.items()
-        if NOTE in str(row.get("note") or "")
+        if _is_sync_note(row.get("note"))
     }
 
     # ---- 计算目标集合
@@ -459,9 +514,39 @@ def run_once(
     # 只增不减才是安全的：入向就是同花顺有什么就同步什么。
     want_apply = state.get("sync_ths_to_tsp", True)
     self_codes_native = self_codes
-    desired_self: set[str] = set(self_codes_native or []) if want_apply else set()
-    desired_pos: set[str] = {p.code for p in (positions or [])} if want_apply else set()
+    desired_self: set[str] = {
+        reader.to_tsp_symbol(x) for x in (self_codes_native or []) if reader.to_tsp_symbol(x)
+    } if want_apply else set()
+    desired_pos: set[str] = {
+        reader.to_tsp_symbol(p.code) for p in (positions or []) if reader.to_tsp_symbol(p.code)
+    } if want_apply else set()
     desired_all = desired_self | desired_pos
+
+    # 板块入向：B=方案 1，空板块跳过；成分统一转 canonical。
+    block_codes_by_group: dict[str, set[str]] = {}
+    desired_block: set[str] = set()
+    if want_apply and user is not None:
+        try:
+            blocks = reader.list_blocks(user) or []
+        except Exception as exc:
+            blocks = []
+            result["skipped"].append("板块枚举失败：%s" % exc)
+        for blk in blocks:
+            blk_name = str(blk.get("name") or "").strip()
+            try:
+                blk_count = int(blk.get("count") or 0)
+            except (TypeError, ValueError):
+                blk_count = 0
+            if not blk_name or blk_count <= 0:
+                continue
+            raw_codes = reader.read_block_codes(blk_name, user) or []
+            canon = {
+                reader.to_tsp_symbol(c) for c in raw_codes if reader.to_tsp_symbol(c)
+            }
+            if not canon:
+                continue
+            block_codes_by_group[blk_name] = canon
+            desired_block |= canon
 
     # 本轮没读到的那一路，其原有条目保留，不能因为 None 被当成空集删掉。
     # 两条通道各自独立保留：曾经用一个 keep 混着装，结果是「同花顺自选」的 40 多只
@@ -487,12 +572,29 @@ def run_once(
         if group_pos_id:
             keep_pos |= _group_members(current_rows, group_pos_id)
 
-    desired_effective = desired_all | keep_self | keep_pos
+    keep_self = {reader.to_tsp_symbol(c) or c for c in keep_self}
+    keep_pos = {reader.to_tsp_symbol(c) or c for c in keep_pos}
+    keep_block: set[str] = set()
+    try:
+        for grp in watchlist.list_groups() or []:
+            gname = str(grp.get("name") or "")
+            gid = str(grp.get("id") or "")
+            if not gname.startswith(GROUP_BLOCK_PREFIX) or not gid:
+                continue
+            keep_block |= {
+                reader.to_tsp_symbol(c)
+                for c in _group_members(current_rows, gid)
+                if reader.to_tsp_symbol(c)
+            }
+    except Exception:
+        pass
+    desired_effective = desired_all | desired_block | keep_self | keep_pos | keep_block
 
     # ---- 写 TSP：新增
     to_add_self = sorted(desired_self - set(current))
     to_add_pos = sorted(desired_pos - set(current) - set(to_add_self))
-    to_add = to_add_self + to_add_pos
+    to_add_block = sorted(desired_block - set(current) - set(to_add_self) - set(to_add_pos))
+    to_add = to_add_self + to_add_pos + to_add_block
 
     # ---- 写 TSP：删除（只删自己标记过的）
     to_remove = sorted(owned - desired_effective)
@@ -546,6 +648,15 @@ def run_once(
         # 校正两个分组的成员集合（把不该在的移出去）
         _sync_group_members(group_self_id, desired_self | keep_self, result["group_actions"])
         _sync_group_members(group_pos_id, desired_pos | keep_pos, result["group_actions"])
+        # 板块入向：每个非空板块单独建组，成分写进池子并打 NOTE_BLOCK。
+        for blk_name, canon in sorted(block_codes_by_group.items()):
+            gid, act_blk = _ensure_group(_block_group_name(blk_name), COLOR_SELF)
+            if act_blk:
+                result["group_actions"].append(act_blk)
+            if not gid:
+                continue
+            watchlist.add_batch(sorted(canon), note=NOTE_BLOCK, group_ids=[gid])
+            _sync_group_members(gid, canon, result["group_actions"])
     else:
         result["added"] = to_add
         result["removed"] = to_remove
@@ -565,9 +676,9 @@ def run_once(
             native = [
                 str(r.get("symbol") or "")
                 for r in rows_now
-                if NOTE not in str(r.get("note") or "")
+                if not _is_sync_note(r.get("note"))
             ]
-            native = [c for c in native if reader.is_a_stock(c)]
+            native = [c for c in (reader.to_ths_code(x) for x in native) if c]
             seen: set[str] = set()
             native_unique = [c for c in native if not (c in seen or seen.add(c))]
         except Exception as exc:
@@ -681,9 +792,9 @@ def run_once(
                 native_codes = [
                     str(r.get("symbol") or "")
                     for r in rows_now
-                    if NOTE not in str(r.get("note") or "")
+                    if not _is_sync_note(r.get("note"))
                 ]
-                native_codes = [c for c in native_codes if reader.is_a_stock(c)]
+                native_codes = [c for c in (reader.to_ths_code(x) for x in native_codes) if c]
             except Exception as exc:
                 native_codes = []
                 result["errors"].append("计算待写自选缓存清单失败：%s" % exc)
@@ -783,8 +894,8 @@ def build_status() -> dict[str, Any]:
         rows = watchlist.list_symbols()
     except Exception:
         rows = []
-    owned = [r for r in rows if NOTE in str(r.get("note") or "")]
-    native = [r for r in rows if NOTE not in str(r.get("note") or "")]
+    owned = [r for r in rows if _is_sync_note(r.get("note"))]
+    native = [r for r in rows if not _is_sync_note(r.get("note"))]
 
     groups = []
     try:
@@ -805,6 +916,8 @@ def build_status() -> dict[str, Any]:
     block_codes = reader.read_block_codes(block_name, user) if user else None
 
     pos_dicts = [p.as_dict() for p in positions]
+    for d in pos_dicts:
+        d["symbol"] = reader.to_tsp_symbol(d.get("code") or "") or d.get("code")
     return {
         "ok": True,
         "engine": {

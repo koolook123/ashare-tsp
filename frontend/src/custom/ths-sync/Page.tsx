@@ -14,11 +14,13 @@ import {
 import { PageHeader } from '@/components/PageHeader'
 import { fmtPct, fmtPrice, priceColorClass } from '@/lib/format'
 import { cn } from '@/lib/cn'
+import { openStockPreview } from '@/extensions/stockPreview'
 
 const API = '/api/custom/ths-sync'
 
 interface PositionRow {
   code: string
+  symbol?: string | null
   name?: string | null
   qty?: number | null
   avail?: number | null
@@ -499,7 +501,7 @@ export function ThsSync() {
                     {positions.map(row => (
                       <tr key={row.code} className="border-t border-border/50">
                         <td className="px-4 py-1.5 font-mono text-[11px] text-secondary">
-                          {row.code}
+                          <button type="button" title="点击查看 TSP 原生个股详情" onClick={() => openStockPreview({ symbol: row.symbol || row.code, name: row.name })} className="transition-colors hover:text-accent hover:underline">{row.code}</button>
                         </td>
                         <td className="px-2 py-1.5 text-foreground">{row.name || '—'}</td>
                         <td className="px-2 py-1.5 text-right font-mono text-secondary">

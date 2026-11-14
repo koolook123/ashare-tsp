@@ -68,6 +68,37 @@ def is_a_stock(code: str) -> bool:
     return bool(_A_STOCK_RE.match(code or ""))
 
 
+#: TSP 原生个股预览只认「6 位码 + 交易所后缀」（600519.SH / 000001.SZ / 830001.BJ）。
+#: 同花顺文件里始终是裸 6 位码；写进 TSP 自选池前必须转成 canonical，
+#: 否则 TSP 的 stockPreviewStore 会拒绝裸码，BOSS 的「原生查看股票」不可用。
+_TSP_SYMBOL_RE = re.compile(r"^\d{6}\.(SH|SZ|BJ)$", re.I)
+
+
+def to_tsp_symbol(code: str) -> str | None:
+    """同花顺裸码 / 已是 canonical 的码 → TSP canonical；非 A 股返回 None（幂等）。"""
+    c = str(code or "").strip().upper()
+    if _TSP_SYMBOL_RE.match(c):
+        return c
+    if not is_a_stock(c):
+        return None
+    head = c[0]
+    if head == "6":
+        return c + ".SH"
+    if head in ("0", "3"):
+        return c + ".SZ"
+    if head in ("8", "4"):
+        return c + ".BJ"
+    return None
+
+
+def to_ths_code(code: str) -> str | None:
+    """TSP canonical / 裸码 → 同花顺 6 位裸码；非 A 股返回 None（幂等）。"""
+    c = str(code or "").strip().upper()
+    if _TSP_SYMBOL_RE.match(c):
+        c = c.split(".", 1)[0]
+    return c if is_a_stock(c) else None
+
+
 @dataclass
 class ThsUser:
     """一个同花顺登录用户的目录。"""
