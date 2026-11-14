@@ -1,0 +1,18 @@
+{
+  "id": "koolook.ths-sync",
+  "name": "同花顺同步",
+  "version": "0.7.0",
+  "description": "TSP ↔ 同花顺远航版双向同步：自选/持仓/AI选股零截断、原生预览、零弹窗",
+  "author": "koolook",
+  "license": "MIT",
+  "tsp_min_version": "0.3.34",
+  "backend": {
+    "entry": "backend/ths_sync/__init__.py",
+    "setup": "setup",
+    "startup": "startup"
+  },
+  "frontend": {
+    "entry": "frontend/ths-sync/extension.tsx"
+  },
+  "permissions": ["ths_sync", "watchlist", "stock_preview"]
+}
