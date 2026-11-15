@@ -1,18 +1,13 @@
 # -*- coding: utf-8 -*-
-"""校验 koolook.ths-sync-pack ZIP：本地契约 + 运行期 /api/import-center/inspect。
-
-用法：
-    "C:/Python314/python.exe" tools/verify_ths_sync_extension.py
-"""
+"""校验 koolook.ths-sync-pack ZIP：本地契约 + 运行期 /api/import-center/inspect。"""
 from __future__ import annotations
 
 import ast
 import io
 import json
-import re
 import sys
-import urllib.request
 import urllib.error
+import urllib.request
 import uuid
 import zipfile
 from pathlib import Path, PurePosixPath
@@ -34,6 +29,7 @@ REQUIRED = {
     "backend/ths_sync/routes.py",
     "backend/ths_sync/service.py",
     "backend/ths_sync/ths_agent.py",
+    "backend/ths_sync/tzzb_source.py",
     "backend/ths_sync/writer.py",
     "backend/ths_sync/xd_screen.py",
     "frontend/extension.mjs",
@@ -50,8 +46,10 @@ def check(condition: bool, message: str) -> None:
 def multipart_upload(data: bytes, filename: str) -> tuple[int, bytes]:
     boundary = "----ths-sync-pack-" + uuid.uuid4().hex
     body = io.BytesIO()
+
     def w(part: bytes) -> None:
         body.write(part)
+
     w(("--" + boundary + "\r\n").encode())
     w(('Content-Disposition: form-data; name="files"; filename="%s"\r\n' % filename).encode())
     w(b"Content-Type: application/zip\r\n\r\n")
@@ -119,6 +117,7 @@ def main() -> int:
         "requires: []",
     ):
         check(line in yaml_text, "extension.yaml missing: %s" % line)
+    check("TZZB MCP 主源" in yaml_text, "extension.yaml missing TZZB MCP primary source description")
 
     backend = files.get("backend/extension.py", b"").decode("utf-8")
     for snippet in (
@@ -139,15 +138,40 @@ def main() -> int:
     check('return service.run_once(with_positions=False)' in routes, "missing /sync handler")
     check('return service.run_once(with_positions=True)' in routes, "missing /sync/positions handler")
     check('return service.run_once(dry=True)' in routes, "missing /sync/dry handler")
+    check('@router.get("/tzzb")' in routes, "missing /tzzb endpoint")
+    check("service.tzzb_summary()" in routes, "/tzzb endpoint missing service.tzzb_summary()")
+    check("service.read_positions_any(allow_screen=False)" in routes, "preview missing unified source chain")
+    check("positions_channel" in routes, "preview missing positions_channel")
 
     service = files.get("backend/ths_sync/service.py", b"").decode("utf-8")
-    check('STATE_VERSION = 3' in service, "service not v3")
+    check("STATE_VERSION = 3" in service, "service not v3")
     check('NOTE_BLOCK = "同花顺板块"' in service, "service missing NOTE_BLOCK")
-    check('from . import tzzb' not in service, "MCP half-implementation import remains")
-    check('query_positions_mcp' not in service, "query_positions_mcp remains")
-    check('reader.to_tsp_symbol' in service, "canonical ingress missing")
-    check('reader.to_ths_code' in service, "canonical egress missing")
+    check("from . import tzzb_source" in service, "service missing tzzb_source import")
+    check("def read_positions_any(*, allow_screen: bool = True)" in service, "read_positions_any guard missing")
+    check("tzzb_source.read_positions" in service, "TZZB MCP primary read missing")
+    check("read_positions_any(allow_screen=False)" in service, "status screen guard missing")
+    check("def tzzb_summary()" in service, "tzzb_summary missing")
+    check("tzzb_source.read_trade_summary()" in service, "trade summary delegation missing")
+    check("query_positions_mcp" not in service, "query_positions_mcp remains")
+    check("reader.to_tsp_symbol" in service, "canonical ingress missing")
+    check("reader.to_ths_code" in service, "canonical egress missing")
     check('d["symbol"] = reader.to_tsp_symbol' in service, "position symbol missing")
+
+    tzzb = files.get("backend/ths_sync/tzzb_source.py", b"").decode("utf-8")
+    for marker in ("CREATE_NO_WINDOW", "STARTF_USESHOWWINDOW", "SW_HIDE", "shell=False"):
+        check(marker in tzzb, "tzzb_source.py missing no-window marker: %s" % marker)
+    for tool in (
+        "TZZB.promptAccountSelection",
+        "TZZB.queryStockPosition",
+        "TZZB.queryPnlSummary",
+        "TZZB.queryClearedPosition",
+        "TZZB.queryMoneyHistory",
+        "TZZB.queryAssetChangeSummary",
+        "TZZB.queryDayProfitSummary",
+    ):
+        check(tool in tzzb, "tzzb_source.py missing tool: %s" % tool)
+    for fn in ("call_tool", "positions_from_payload", "read_positions", "read_snapshot", "read_trade_summary"):
+        check("def %s" % fn in tzzb, "tzzb_source.py missing function: %s" % fn)
 
     reader = files.get("backend/ths_sync/reader.py", b"").decode("utf-8")
     check("def to_tsp_symbol(code: str) -> str | None:" in reader, "to_tsp_symbol missing")
@@ -172,7 +196,6 @@ def main() -> int:
     check("path: '/ths-sync-pack'" in frontend, "frontend route path missing")
     check("icon: 'Database'" in frontend, "frontend navigation icon missing")
 
-    # Running TSP inspect (HTTP) verifies the real ExtensionPackageStore contract.
     status, raw = multipart_upload(data, ZIP.name)
     check(status == 200, "inspect HTTP %s body=%s" % (status, raw[:500].decode("utf-8", "replace")))
     try:

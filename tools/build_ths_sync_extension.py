@@ -32,12 +32,13 @@ PACKAGE_ID = "koolook.ths-sync-pack"
 VERSION = "1.0.0"
 API_PREFIX = "/api/extensions/" + PACKAGE_ID
 
-# __init__.py 单独生成，其余六个从 canonical 复制
+# __init__.py 单独生成，其余七个从 canonical 复制
 MODULES = (
     "reader.py",
     "routes.py",
     "service.py",
     "ths_agent.py",
+    "tzzb_source.py",
     "writer.py",
     "xd_screen.py",
 )
@@ -49,7 +50,7 @@ display_name: 同花顺同步（独立扩展包）
 version: 1.0.0
 extension_api_version: 1
 author: koolook
-description: 同花顺远航版自选/持仓/板块汇入 TSP；canonical 代码可点开原生个股详情；ctypes 探测进程零弹框；写回只加不减
+description: 同花顺远航版自选/持仓/板块汇入 TSP；TZZB MCP 主源读取持仓/交易；canonical 代码可点开原生个股详情；ctypes 探测进程零弹框；写回只加不减
 backend: backend.extension
 frontend: frontend/extension.mjs
 requires_app: '>=0.3.25'

@@ -95,7 +95,7 @@ def get_preview() -> dict:
     """只读预览：两边各读到什么。用于排查「为什么没同步过来」。"""
     user = reader.find_user()
     self_codes = reader.read_selfstock(user)
-    positions = reader.read_positions()
+    positions, positions_channel = service.read_positions_any(allow_screen=False)
     agent_ok = reader.agent_alive()
     block_name = str(service.get_state().get("block_name") or service.DEFAULT_BLOCK)
     block_codes = reader.read_block_codes(block_name, user)
@@ -109,6 +109,8 @@ def get_preview() -> dict:
         "selfstock": self_codes or [],
         "selfstock_count": len(self_codes or []),
         "agent_ok": agent_ok,
+        "positions_channel": positions_channel,
+        "positions_source": "TZZB MCP" if positions_channel == "tzzb" else positions_channel,
         "positions_ok": positions is not None,
         "positions": [p.as_dict() for p in (positions or [])],
         "positions_count": len(positions or []),
@@ -117,6 +119,16 @@ def get_preview() -> dict:
         "block_codes": block_codes or [],
         "block_count": len(block_codes or []),
     }
+
+
+@router.get("/tzzb")
+def get_tzzb() -> dict:
+    """TZZB 投资账本 MCP 主源：账户、持仓、盈亏、清仓、资金流水、资产变动、逐日盈亏。"""
+    try:
+        return service.tzzb_summary()
+    except Exception as exc:
+        logger.exception("读取 TZZB 投资账本失败")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @router.get("/blocks")

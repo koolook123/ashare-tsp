@@ -5,25 +5,24 @@
 ========
 1. **不用桥**。同步逻辑跑在 TSP 后端进程内，直接调 ``app.services.watchlist``
    的函数写自选池，不经过 HTTP、不起额外进程、不注册端口。
-2. **不抢前台**。所有与同花顺的交互只有两种：读磁盘文件、读写磁盘文件。
-   不模拟点击、不切窗口、不抢焦点。持仓靠同花顺进程内代理取，也不需要窗口。
-3. **数据精准**。「同步」的语义是：同步后目标端**正好等于**源端，
-   而不是「只增不删」。写板块带回归校验，写 TSP 只删自己标记过的条目。
+2. **不抢前台**。持仓/交易主源走 TZZB 投资账本 MCP 的本地无窗口 CLI；
+   自选/板块走磁盘文件；17660 代理与屏幕 OCR 仅作降级，不模拟点击、不切窗口。
+3. **数据精准**。TSP 入池标的保持 canonical；写回同花顺只做加法，避免回环截断。
 4. **不误伤**。读失败一律视为「本轮跳过」，绝不把空集当成「用户清空了」，
    否则一次读盘抖动就会把自选池清空。
 
 两个方向
 ========
 * ``同花顺 → TSP``：自选股 ``SelfStockCache.json`` 自动汇入「同花顺自选」分组；
-  持仓 ``g_position`` **只在手动一键同步时**汇入「同花顺持仓」分组。
+  持仓/交易由 TZZB 投资账本 MCP 主源提供，手动一键同步时汇入「同花顺持仓」分组。
 * ``TSP → 同花顺``：写 ``SelfStockCache.json`` 自选缓存（TSP → 同花顺 的主通道）。
   写板块 ``ai选股`` 默认关闭，理由见下。
 
 为什么「自动只跑自选、持仓走手动」
 ----------------------------------
-持仓必须连同花顺进程内代理（``127.0.0.1:17660``）才能读。代理没起时每次读都要走满
-socket 超时；自动线程每 60 秒一轮，会被它拖慢，而且用户没有「实时看持仓」的需求。
-所以自动轮询只跑自选（纯读文件，几十毫秒），持仓由页面上的「一键同步」手动触发。
+持仓主源 TZZB MCP 通过无窗口 mcporter CLI 读取账户、持仓、盈亏、清仓与资金流水；
+降级链为 17660 代理 → 屏幕 OCR。自动轮询仍只跑自选纯文件读，持仓与交易摘要由
+页面上的「一键同步」或 ``/tzzb`` 端点显式触发，避免后台线程持续调用外部数据源。
 
 为什么 TSP → 同花顺 写自选而不是写板块
 --------------------------------------
@@ -73,6 +72,7 @@ from typing import Any
 from app.services import watchlist
 
 from . import reader
+from . import tzzb_source
 from . import xd_screen
 from . import writer
 
@@ -299,11 +299,21 @@ def _positions_from_screen() -> tuple[list[reader.Position] | None, str]:
     return out, "screen"
 
 
-def read_positions_any() -> tuple[list[reader.Position] | None, str]:
-    """读持仓：进程内代理（17660）优先，其次下单端屏幕 OCR 兜底。"""
+_TZZB_META: dict[str, Any] = {"ok": False, "source": "TZZB MCP", "errors": []}
+
+
+def read_positions_any(*, allow_screen: bool = True) -> tuple[list[reader.Position] | None, str]:
+    """读持仓：TZZB MCP 主源 → 17660 代理 → 屏幕 OCR；状态汇总禁用 OCR。"""
+    global _TZZB_META
+    mcp_positions, meta = tzzb_source.read_positions()
+    _TZZB_META = meta
+    if mcp_positions is not None:
+        return mcp_positions, "tzzb"
     positions = reader.read_positions()
     if positions is not None:
         return positions, "agent"
+    if not allow_screen:
+        return None, "tzzb,agent"
     return _positions_from_screen()
 
 
@@ -869,24 +879,65 @@ def _record(result: dict[str, Any]) -> None:
 # ---------------------------------------------------------------- 状态汇总
 
 
+def tzzb_summary() -> dict[str, Any]:
+    """显式读取 TZZB 投资账本 MCP 的账户、持仓、盈亏与交易信息。"""
+    positions, positions_channel = read_positions_any(allow_screen=False)
+    meta = dict(_TZZB_META)
+    snapshot = tzzb_source.read_snapshot()
+    trades = tzzb_source.read_trade_summary()
+    pos_dicts = [p.as_dict() for p in (positions or [])]
+    if not pos_dicts:
+        pos_dicts = list(snapshot.get("positions") or [])
+    for d in pos_dicts:
+        d["symbol"] = reader.to_tsp_symbol(d.get("code") or "") or d.get("code")
+    account = meta.get("account") or snapshot.get("account") or {}
+    last_sync_time = ""
+    try:
+        for row in (account.get("fund_key") or []) if isinstance(account, dict) else []:
+            if isinstance(row, dict) and row.get("lastSyncTime"):
+                last_sync_time = str(row.get("lastSyncTime") or "")
+                break
+    except Exception:
+        last_sync_time = ""
+    errors: list[str] = []
+    for item in (meta, snapshot, trades):
+        errors.extend(str(e) for e in (item.get("errors") or []) if e)
+    pnl = snapshot.get("pnl") if isinstance(snapshot.get("pnl"), dict) else {}
+    return {
+        "ok": bool(pos_dicts) and not errors,
+        "source": "TZZB MCP",
+        "account": account,
+        "fund_key": meta.get("fund_key") or "",
+        "lastSyncTime": last_sync_time,
+        "available_funds": meta.get("available_funds") or "",
+        "total_asset": meta.get("total_asset") or "",
+        "total_market_value": meta.get("total_market_value") or "",
+        "position_ratio": meta.get("position_ratio") or "",
+        "positions": pos_dicts,
+        "positions_count": len(pos_dicts),
+        "positions_ok": bool(pos_dicts),
+        "positions_channel": "tzzb" if positions is not None else (snapshot.get("source") or ""),
+        "pnl": pnl,
+        "net_value_trend": pnl.get("netValueTrend") or [],
+        "sh_index_trend": pnl.get("shIndexTrend") or [],
+        "cleared": trades.get("cleared") or [],
+        "money_history": trades.get("money_history") or {},
+        "asset_change": trades.get("asset_change") or {},
+        "day_profit": trades.get("day_profit") or {},
+        "snapshot": snapshot,
+        "trade_summary": trades,
+        "errors": errors,
+    }
+
+
 def build_status() -> dict[str, Any]:
     """给前端的一站式状态。"""
     user = reader.find_user()
     state = get_state()
 
     agent_ok = reader.agent_alive()
-    positions: list[reader.Position] = []
-    positions_channel = ""
-    if agent_ok:
-        positions = reader.read_positions() or []
-        if positions:
-            positions_channel = "agent"
-    if not positions:
-        # 代理没起时不要空着——下单端窗口上就有持仓表，屏幕 OCR 兜底
-        screen_positions, channel = _positions_from_screen()
-        if screen_positions:
-            positions = screen_positions
-            positions_channel = channel
+    positions, positions_channel = read_positions_any(allow_screen=False)
+    positions = positions or []
 
     self_codes = reader.read_selfstock(user) if user else None
 
@@ -914,6 +965,14 @@ def build_status() -> dict[str, Any]:
 
     block_name = str(state.get("block_name") or DEFAULT_BLOCK)
     block_codes = reader.read_block_codes(block_name, user) if user else None
+
+    tzzb_meta = dict(_TZZB_META)
+    tzzb_account = tzzb_meta.get("account") if isinstance(tzzb_meta.get("account"), dict) else {}
+    tzzb_last_sync_time = ""
+    for row in tzzb_account.get("fund_key") or []:
+        if isinstance(row, dict) and row.get("lastSyncTime"):
+            tzzb_last_sync_time = str(row.get("lastSyncTime") or "")
+            break
 
     pos_dicts = [p.as_dict() for p in positions]
     for d in pos_dicts:
@@ -954,6 +1013,12 @@ def build_status() -> dict[str, Any]:
             "positions_ok": bool(positions),
             "positions_channel": positions_channel,
             "positions_count": len(positions),
+            "positions_source": positions_channel,
+            "mcp_ok": bool(tzzb_meta.get("ok")),
+            "mcp_source": tzzb_meta.get("source") or "TZZB MCP",
+            "mcp_fund_key": tzzb_meta.get("fund_key") or "",
+            "lastSyncTime": tzzb_last_sync_time,
+            "mcp_errors": tzzb_meta.get("errors") or [],
             "block_name": block_name,
             "block_count": len(block_codes or []) if block_codes is not None else None,
             "block_ok": block_codes is not None,
